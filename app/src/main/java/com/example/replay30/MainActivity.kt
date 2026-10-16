@@ -14,6 +14,7 @@ import android.os.HandlerThread
 import android.content.pm.PackageManager
 import android.content.ContentValues
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.graphics.Color
 import android.net.Uri
 import android.net.ConnectivityManager
@@ -33,6 +34,8 @@ import android.media.MediaMuxer
 import android.media.AudioRecord
 import android.media.AudioFormat
 import android.media.MediaRecorder
+import android.media.AudioManager
+import android.media.ToneGenerator
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.Inet4Address
@@ -88,6 +91,7 @@ class MainActivity : ComponentActivity() {
     private var gestureArmed = true
     private var lastGestureTriggerMs = 0L
     private val gestureCooldownMs = 8_000L
+    private var gestureToneGenerator: ToneGenerator? = null
     private val handler = Handler(Looper.getMainLooper())
     private var remoteServer: ReplayHttpServer? = null
     @Volatile private var isRunning = false
@@ -213,7 +217,7 @@ class MainActivity : ComponentActivity() {
 
     private fun updateGestureButton() {
         if (!::gestureToggleButton.isInitialized) return
-        gestureToggleButton.text = if (gestureEnabled) "GESTO ✌️: ATIVADO (salvar 30 s)" else "GESTO ✌️: DESATIVADO"
+        gestureToggleButton.text = if (gestureEnabled) "GESTO ✋ / ✌️ / 👍: ATIVADO" else "GESTO ✋ / ✌️ / 👍: DESATIVADO"
     }
 
     private fun setGestureDetectionEnabled(enabled: Boolean) {
@@ -224,7 +228,7 @@ class MainActivity : ComponentActivity() {
         gestureArmed = true
         updateGestureButton()
         if (enabled) {
-            status.text = "Ativando reconhecimento do gesto ✌️…"
+            status.text = "Ativando reconhecimento de gestos ✋ / ✌️ / 👍…"
             startGestureRecognizerIfNeeded()
         } else {
             status.text = if (isRunning) "Captura contínua ativa · detecção de gesto desativada" else "Detecção de gesto desativada"
@@ -255,9 +259,9 @@ class MainActivity : ComponentActivity() {
                 gestureRecognizer = recognizer
                 runOnUiThread {
                     if (gestureEnabled) {
-                        status.text = if (isRunning) "Captura ativa · gesto ✌️ habilitado (mantenha por cerca de 1 s)" else "Gesto ✌️ habilitado; inicie a captura para usar"
+                        status.text = if (isRunning) "Captura ativa · gestos ✋ / ✌️ / 👍 habilitados (mantenha por cerca de 1 s)" else "Gestos habilitados; inicie a captura para usar"
                         startGestureFrameLoop()
-                        toast("Detecção do gesto ✌️ ativada. Mantenha o gesto visível por cerca de 1 segundo.")
+                        toast("Gestos ativados: palma aberta, paz e amor ou polegar para cima. Mantenha visível por cerca de 1 segundo.")
                     } else {
                         try { recognizer.close() } catch (_: Exception) {}
                         if (gestureRecognizer === recognizer) gestureRecognizer = null
@@ -290,9 +294,15 @@ class MainActivity : ComponentActivity() {
             }
             if (gestureProcessing.compareAndSet(false, true)) {
                 try {
-                    // Analyze a small copy of the visible preview at low frequency to minimize
-                    // impact on continuous recording and audio capture.
-                    val frame = preview.getBitmap(320, 180)
+                    // Copy the preview using its real aspect ratio. Passing a fixed 320x180
+                    // bitmap stretched portrait previews into landscape and made hand landmarks
+                    // unreliable. Keep the longest side at 320px to limit CPU/memory overhead.
+                    val viewWidth = preview.width.coerceAtLeast(1)
+                    val viewHeight = preview.height.coerceAtLeast(1)
+                    val scale = minOf(320f / viewWidth, 320f / viewHeight, 1f)
+                    val bitmapWidth = (viewWidth * scale).toInt().coerceAtLeast(1)
+                    val bitmapHeight = (viewHeight * scale).toInt().coerceAtLeast(1)
+                    val frame = preview.getBitmap(bitmapWidth, bitmapHeight)
                     if (frame != null) {
                         gestureExecutor.execute {
                             try { analyzeGestureFrame(frame) }
@@ -309,31 +319,75 @@ class MainActivity : ComponentActivity() {
     private fun analyzeGestureFrame(bitmap: Bitmap) {
         if (!gestureEnabled) return
         val recognizer = gestureRecognizer ?: return
-        val result = recognizer.recognize(BitmapImageBuilder(bitmap).build())
-        val isPeace = result.gestures().any { categories ->
-            val top = categories.maxByOrNull { it.score() }
-            top != null && top.categoryName().equals("Victory", ignoreCase = true) && top.score() >= 0.72f
+        // The preview may be exposed by some Camera2 devices in sensor orientation.
+        // Try the normal preview first, then 90°/270° only if no trigger pose was found.
+        // This work stays on the dedicated gesture executor and uses a tiny bitmap.
+        var isTriggerGesture = recognizesTriggerPose(recognizer, bitmap)
+        if (!isTriggerGesture) {
+            for (degrees in intArrayOf(90, 270)) {
+                val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
+                val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                try {
+                    if (recognizesTriggerPose(recognizer, rotated)) {
+                        isTriggerGesture = true
+                        break
+                    }
+                } finally {
+                    if (rotated !== bitmap && !rotated.isRecycled) rotated.recycle()
+                }
+            }
         }
-        if (isPeace) {
+        if (isTriggerGesture) {
             gestureConsecutiveFrames++
             gestureReleaseFrames = 0
-            if (gestureConsecutiveFrames >= 3 && gestureArmed && System.currentTimeMillis() - lastGestureTriggerMs >= gestureCooldownMs && !replayBusy && bufferedDurationLocked() >= 30_000_000L) {
+            val now = System.currentTimeMillis()
+            if (gestureConsecutiveFrames >= 3 && gestureArmed && now - lastGestureTriggerMs >= gestureCooldownMs && !replayBusy) {
                 gestureArmed = false
-                lastGestureTriggerMs = System.currentTimeMillis()
+                lastGestureTriggerMs = now
                 gestureConsecutiveFrames = 0
                 runOnUiThread {
                     if (gestureEnabled && isRunning && !replayBusy) {
-                        status.text = "Gesto ✌️ reconhecido · salvando os últimos 30 segundos…"
-                        toast("Gesto reconhecido! Salvando replay de 30 segundos.")
-                        saveReplay(30)
+                        playGestureNotification()
+                        if (bufferedDurationLocked() >= 30_000_000L) {
+                            status.text = "Gesto reconhecido · salvando os últimos 30 segundos…"
+                            toast("Gesto reconhecido! Salvando replay de 30 segundos.")
+                            saveReplay(30)
+                        } else {
+                            status.text = "Gesto reconhecido · aguarde o buffer completar 30 segundos"
+                            toast("Gesto reconhecido! Aguarde o buffer completar 30 segundos para salvar o replay.")
+                        }
                     }
                 }
             }
         } else {
             gestureConsecutiveFrames = 0
             gestureReleaseFrames++
-            // Require the hand to leave the Victory pose before another automatic trigger.
+            // Require the hand to leave the trigger pose before another automatic trigger.
             if (gestureReleaseFrames >= 5) gestureArmed = true
+        }
+    }
+
+    private fun recognizesTriggerPose(recognizer: GestureRecognizer, bitmap: Bitmap): Boolean {
+        // Open_Palm is the easiest, most natural gesture to recognize at a distance.
+        // Victory and Thumb_Up are accepted alternatives.
+        val triggerNames = setOf("openpalm", "victory", "thumbup")
+        val result = recognizer.recognize(BitmapImageBuilder(bitmap).build())
+        return result.gestures().any { categories ->
+            categories.any { category ->
+                val normalizedName = category.categoryName().replace("_", "").replace(" ", "").lowercase(Locale.US)
+                normalizedName in triggerNames && category.score() >= 0.50f
+            }
+        }
+    }
+
+    private fun playGestureNotification() {
+        try {
+            val tone = gestureToneGenerator ?: ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90).also {
+                gestureToneGenerator = it
+            }
+            tone.startTone(ToneGenerator.TONE_PROP_ACK, 300)
+        } catch (_: Exception) {
+            // Audio notification is best-effort; it must never interfere with recording.
         }
     }
 
@@ -698,7 +752,7 @@ class MainActivity : ComponentActivity() {
     }
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     override fun onDestroy() {
-        remoteServer?.stopServer(); handler.removeCallbacks(gestureFrameRunnable); stopCapture(); try { gestureRecognizer?.close() } catch (_: Exception) {}; gestureRecognizer = null; executor.shutdown(); gestureExecutor.shutdown(); super.onDestroy()
+        remoteServer?.stopServer(); handler.removeCallbacks(gestureFrameRunnable); stopCapture(); try { gestureRecognizer?.close() } catch (_: Exception) {}; gestureRecognizer = null; try { gestureToneGenerator?.release() } catch (_: Exception) {}; gestureToneGenerator = null; executor.shutdown(); gestureExecutor.shutdown(); super.onDestroy()
     }
 }
 
