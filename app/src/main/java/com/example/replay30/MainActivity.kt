@@ -16,6 +16,8 @@ import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.provider.MediaStore
 import android.os.Bundle
@@ -187,19 +189,43 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun controlUrl(): String {
-        val wifiIp = try {
+        // Prefer the IPv4 address attached to an actual Wi-Fi network. This avoids
+        // accidentally publishing a VPN, cellular, or stale DHCP address in the QR code.
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val wifiNetworkIp = try {
+            cm.allNetworks.asSequence()
+                .filter { network -> cm.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
+                .flatMap { network ->
+                    (cm.getLinkProperties(network)?.linkAddresses ?: emptyList()).asSequence()
+                }
+                .mapNotNull { it.address as? Inet4Address }
+                .firstOrNull { isUsableLanIpv4(it) }
+                ?.hostAddress
+        } catch (_: Exception) { null }
+        if (!wifiNetworkIp.isNullOrBlank()) return "http://$wifiNetworkIp:8765"
+
+        // Fallback for Android builds that do not expose Wi-Fi LinkProperties reliably.
+        val interfaceIp = try {
+            java.util.Collections.list(NetworkInterface.getNetworkInterfaces()).asSequence()
+                .filter { it.isUp && !it.isLoopback && (it.name.startsWith("wlan", true) || it.name.startsWith("wifi", true) || it.name.startsWith("ap", true) || it.name.startsWith("swlan", true)) }
+                .flatMap { java.util.Collections.list(it.inetAddresses).asSequence() }
+                .filterIsInstance<Inet4Address>()
+                .firstOrNull { isUsableLanIpv4(it) }
+                ?.hostAddress
+        } catch (_: Exception) { null }
+        if (!interfaceIp.isNullOrBlank()) return "http://$interfaceIp:8765"
+
+        // Last resort: DHCP address, which is IPv4 little-endian on Android.
+        val dhcpIp = try {
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             val n = wm.dhcpInfo.ipAddress
             if (n == 0) null else "${n and 255}.${(n shr 8) and 255}.${(n shr 16) and 255}.${(n shr 24) and 255}"
         } catch (_: Exception) { null }
-        val ip = wifiIp ?: try {
-            java.util.Collections.list(NetworkInterface.getNetworkInterfaces()).asSequence().filter { it.isUp && !it.isLoopback }
-                .sortedBy { if (it.name.startsWith("wlan") || it.name.startsWith("ap")) 0 else 1 }
-                .flatMap { java.util.Collections.list(it.inetAddresses).asSequence() }.filterIsInstance<Inet4Address>()
-                .firstOrNull { !it.isLoopbackAddress && it.hostAddress != null }?.hostAddress
-        } catch (_: Exception) { null }
-        return if (ip == null) "" else "http://$ip:8765"
+        return if (dhcpIp.isNullOrBlank() || dhcpIp == "0.0.0.0") "" else "http://$dhcpIp:8765"
     }
+
+    private fun isUsableLanIpv4(address: Inet4Address): Boolean =
+        !address.isLoopbackAddress && !address.isLinkLocalAddress && !address.isMulticastAddress && address.isSiteLocalAddress
 
     private fun hasCameraPermission() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
     private fun hasAudioPermission() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -534,13 +560,8 @@ private class ReplayHttpServer(private val activity: MainActivity, private val o
     fun start() {
         Thread {
             try {
-                server = ServerSocket(8765)
-                val ip = try {
-                    val wm = activity.applicationContext.getSystemService(android.content.Context.WIFI_SERVICE) as WifiManager
-                    val n = wm.dhcpInfo.ipAddress
-                    if (n == 0) "IP-DO-CELULAR" else "${n and 255}.${(n shr 8) and 255}.${(n shr 16) and 255}.${(n shr 24) and 255}"
-                } catch (_: Exception) { "IP-DO-CELULAR" }
-                activity.runOnUiThread { activity.setRemoteText("Controle remoto pronto · mesma rede Wi-Fi · toque em QR Code") }
+                server = ServerSocket(8765, 8, java.net.InetAddress.getByName("0.0.0.0"))
+                activity.runOnUiThread { activity.setRemoteText("Controle remoto pronto na porta 8765 · conecte os dois celulares à mesma rede Wi-Fi e toque em QR Code") }
                 while (running) {
                     val client = server?.accept() ?: break
                     Thread { handle(client) }.start()

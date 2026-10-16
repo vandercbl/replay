@@ -1,22 +1,15 @@
-# Replay30 — captura contínua com áudio (protótipo)
+# Replay30 — captura contínua com áudio
 
-Esta versão adiciona captura contínua de áudio à arquitetura Camera2 + MediaCodec:
+Aplicativo Android de replay esportivo com captura contínua, buffer circular, áudio AAC, vídeo H.264, salvamento de replay de 30/60 segundos e controle remoto por navegador na rede local.
 
-- Camera2 mantém a câmera aberta e entrega frames continuamente ao encoder H.264.
-- O microfone é capturado continuamente com `AudioRecord` e codificado em AAC a 48 kHz mono.
-- Áudio e vídeo são mantidos em buffers circulares limitados por tempo e memória.
-- Ao solicitar replay de 30 ou 60 segundos, o app muxa as amostras de áudio e vídeo em um MP4 sem reiniciar a câmera.
-- Mantém preview, orientação vertical, botões de replay, QR Code e controle remoto por Wi-Fi.
-- Os MP4 são publicados em `Movies/Replay30`.
+## Correção do QR Code / endereço IP
 
-## Permissões
+A tela de QR Code agora prioriza o IPv4 anunciado nas propriedades da conexão Wi-Fi ativa. Se isso não estiver disponível, tenta interfaces de rede locais com nomes típicos de Wi-Fi/hotspot e, por último, o endereço DHCP do Wi-Fi. O servidor HTTP escuta explicitamente em `0.0.0.0:8765` para aceitar conexões IPv4 na rede local.
 
-O aplicativo precisa de permissão para câmera e microfone. Se o acesso ao microfone for negado, a captura não inicia, pois esta versão foi preparada para gerar replay com áudio.
+Para controlar o app, conecte os dois celulares à mesma rede Wi-Fi e abra o QR Code no Replay30. Algumas redes de convidados, redes corporativas ou hotspots podem bloquear comunicação entre dispositivos; nesse caso, use uma rede que permita conexões locais entre os celulares.
 
-## Importante
+## Build
 
-Este código-fonte foi alterado para incluir áudio, mas não foi possível compilar nem testar em um aparelho Android real neste ambiente. A sincronização, o encoder AAC disponível no aparelho e o comportamento do buffer precisam ser validados no dispositivo. Faça um teste curto falando perto do celular e reproduzindo o MP4 antes de usar em uma gravação importante.
+Abra o projeto no Android Studio ou envie o conteúdo para o repositório GitHub configurado com o workflow de build. Compile e teste no dispositivo real antes de usar em atividade esportiva.
 
-## Build pelo GitHub Actions
-
-Envie o conteúdo da pasta `Replay30` para a raiz do repositório e execute o workflow **Build Android APK** em Actions. O artefato esperado é `Replay30-debug-apk`.
+Permissões necessárias: câmera e microfone. O controle remoto funciona localmente pela porta TCP `8765` e não usa nuvem.
