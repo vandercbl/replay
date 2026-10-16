@@ -1,9 +1,18 @@
 package com.example.replay30
 
 import android.Manifest
+import android.content.Context
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
+import android.graphics.SurfaceTexture
+import android.media.MediaFormat
+import android.media.MediaCodecInfo
+import android.os.HandlerThread
 import android.content.pm.PackageManager
 import android.content.ContentValues
-import android.app.AlertDialog
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
@@ -18,7 +27,6 @@ import android.view.WindowManager
 import android.view.Surface
 import android.net.wifi.WifiManager
 import android.media.MediaCodec
-import android.media.MediaExtractor
 import android.media.MediaMuxer
 import java.net.ServerSocket
 import java.net.Socket
@@ -30,18 +38,12 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import android.view.TextureView
+import android.util.Size
+import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.CameraSelector
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.FileOutputOptions
-import androidx.camera.video.Quality
-import androidx.camera.video.QualitySelector
-import androidx.camera.video.Recorder
-import androidx.camera.video.Recording
-import androidx.camera.video.VideoCapture
-import androidx.camera.video.VideoRecordEvent
-import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import java.io.File
 import java.text.SimpleDateFormat
@@ -54,35 +56,50 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 
 /**
- * Replay30 prototype. Rotates 5-second MP4 segments and preserves the recent segment window.
- * Maintains a rolling set of short MP4 segments and joins the most recent 30/60 seconds on demand.
+ * Replay30 continuous capture implementation.
+ * Camera2 sends frames continuously to a MediaCodec surface. Encoded H.264 access units are
+ * held in a bounded rolling buffer; saving a replay muxes buffered samples without restarting camera.
  */
 class MainActivity : ComponentActivity() {
     private lateinit var mainRoot: LinearLayout
-    private lateinit var preview: PreviewView
+    private lateinit var preview: TextureView
     private lateinit var status: TextView
     private lateinit var replayButton: Button
     private lateinit var toggleButton: Button
     private lateinit var remoteInfo: TextView
     private lateinit var executor: ExecutorService
     private val handler = Handler(Looper.getMainLooper())
-    private val segmentMs = 5_000L
-    private val keepSegments = 16 // about 80 seconds, enough for a 60-second replay
-    private val segments = ArrayDeque<File>()
-    private var videoCapture: VideoCapture<Recorder>? = null
-    private var recording: Recording? = null
-    private var isRunning = false
-    private var segmentStartedAt = 0L
-    private var replayBusy = false
-    private var replayRequested = false
-    private var replaySeconds = 30
     private var remoteServer: ReplayHttpServer? = null
+    private var isRunning = false
+    private var replayBusy = false
+    private var replaySeconds = 30
+    private var cameraDevice: CameraDevice? = null
+    private var cameraSession: CameraCaptureSession? = null
+    private var cameraThread: HandlerThread? = null
+    private var cameraHandler: Handler? = null
+    private var encoder: MediaCodec? = null
+    private var encoderSurface: Surface? = null
+    private var drainThread: Thread? = null
+    private var captureSize = Size(1920, 1080)
+    private var rotationHint = 90
+    private val bufferLock = Any()
+    private val samples = ArrayDeque<EncodedSample>()
+    private var videoFormat: MediaFormat? = null
+    private var firstPtsUs = -1L
+    private var lastPtsUs = 0L
+    private var bufferedBytes = 0L
+    private val maxBufferUs = 72_000_000L
+    private val maxBufferBytes = 120L * 1024L * 1024L
+    private val captureActive = AtomicBoolean(false)
+
+    private data class EncodedSample(val ptsUs: Long, val flags: Int, val data: ByteArray)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
-        if (result[Manifest.permission.CAMERA] == true) startCamera()
-        else toast("A permissão de câmera é necessária para gravar.")
+        if (result[Manifest.permission.CAMERA] == true) {
+            if (preview.isAvailable) startCamera() else preview.surfaceTextureListener = textureListener
+        } else toast("A permissão de câmera é necessária para gravar.")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -91,9 +108,9 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         buildUi()
         remoteServer = ReplayHttpServer(this) { seconds -> runOnUiThread { saveReplay(seconds) } }.also { it.start() }
-        if (hasPermissions()) startCamera() else permissionLauncher.launch(
-            arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
-        )
+        if (hasCameraPermission()) {
+            if (preview.isAvailable) startCamera() else preview.surfaceTextureListener = textureListener
+        } else permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
     }
 
     private fun buildUi() {
@@ -102,33 +119,21 @@ class MainActivity : ComponentActivity() {
             setPadding(18, 18, 18, 18)
             setBackgroundColor(0xFFFFFFFF.toInt())
         }
-        val title = TextView(this).apply {
-            text = "Replay30"
-            textSize = 25f
-            setTextColor(0xFF111111.toInt())
-            gravity = Gravity.CENTER
-        }
+        mainRoot.addView(TextView(this).apply {
+            text = "Replay30"; textSize = 25f; setTextColor(0xFF111111.toInt()); gravity = Gravity.CENTER
+        })
         status = TextView(this).apply {
-            text = "Preparando câmera…"
-            textSize = 14f
-            gravity = Gravity.CENTER
-            setPadding(0, 8, 0, 12)
+            text = "Preparando captura contínua…"; textSize = 14f; gravity = Gravity.CENTER; setPadding(0, 8, 0, 12)
         }
-        preview = PreviewView(this).apply {
+        preview = TextureView(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-            scaleType = PreviewView.ScaleType.FILL_CENTER
         }
         replayButton = Button(this).apply {
-            text = "SALVAR REPLAY — 30 s"
-            textSize = 17f
-            isEnabled = false
-            setOnClickListener { saveReplay(30) }
+            text = "SALVAR REPLAY — 30 s"; textSize = 17f; isEnabled = false; setOnClickListener { saveReplay(30) }
         }
         toggleButton = Button(this).apply {
-            text = "Parar captura"
-            setOnClickListener { if (isRunning) stopLoop() else startLoop() }
+            text = "Parar captura"; setOnClickListener { if (isRunning) stopCapture() else startCamera() }
         }
-        mainRoot.addView(title)
         mainRoot.addView(status)
         mainRoot.addView(preview)
         mainRoot.addView(replayButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -137,400 +142,260 @@ class MainActivity : ComponentActivity() {
         remoteInfo = TextView(this).apply { textSize = 12f; setTextColor(0xFF555555.toInt()); setPadding(0, 8, 0, 0) }
         mainRoot.addView(remoteInfo)
         mainRoot.addView(Button(this).apply {
-            text = "CONTROLE REMOTO — QR CODE"
-            textSize = 16f
-            setOnClickListener { showQrScreen() }
+            text = "CONTROLE REMOTO — QR CODE"; textSize = 16f; setOnClickListener { showQrScreen() }
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         setContentView(mainRoot)
     }
 
+    private val textureListener = object : TextureView.SurfaceTextureListener {
+        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) { if (hasCameraPermission()) startCamera() }
+        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
+        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
+        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+    }
+
     private fun showQrScreen() {
         val url = controlUrl()
-        if (url.isBlank()) {
-            toast("Não consegui identificar o IP da rede. Conecte o celular a uma rede Wi-Fi e tente novamente.")
-            return
-        }
+        if (url.isBlank()) { toast("Não consegui identificar o IP da rede. Conecte o celular ao Wi-Fi e tente novamente."); return }
         val qrBitmap = try {
             val matrix = QRCodeWriter().encode(url, BarcodeFormat.QR_CODE, 720, 720)
             Bitmap.createBitmap(matrix.width, matrix.height, Bitmap.Config.ARGB_8888).also { bitmap ->
-                for (x in 0 until matrix.width) {
-                    for (y in 0 until matrix.height) {
-                        bitmap.setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
-                    }
-                }
+                for (x in 0 until matrix.width) for (y in 0 until matrix.height) bitmap.setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
             }
-        } catch (e: Exception) {
-            toast("Não foi possível gerar o QR Code: ${e.message}")
-            return
-        }
-
-        val screen = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(24, 24, 24, 24)
-            setBackgroundColor(Color.WHITE)
-        }
-        screen.addView(TextView(this).apply {
-            text = "Controle remoto Replay30"
-            textSize = 24f
-            setTextColor(0xFF111111.toInt())
-            gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        screen.addView(TextView(this).apply {
-            text = "Conecte os dois celulares à mesma rede Wi-Fi. No outro celular, abra a câmera e leia este QR Code."
-            textSize = 16f
-            setTextColor(0xFF333333.toInt())
-            gravity = Gravity.CENTER
-            setPadding(0, 16, 0, 12)
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        screen.addView(ImageView(this).apply {
-            setImageBitmap(qrBitmap)
-            adjustViewBounds = true
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            contentDescription = "QR Code para abrir o controle remoto Replay30"
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        screen.addView(TextView(this).apply {
-            text = url
-            textSize = 14f
-            setTextColor(0xFF333333.toInt())
-            gravity = Gravity.CENTER
-            setPadding(0, 12, 0, 12)
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        screen.addView(Button(this).apply {
-            text = "VOLTAR À CÂMERA"
-            setOnClickListener { setContentView(mainRoot) }
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        } catch (e: Exception) { toast("Não foi possível gerar o QR Code: ${e.message}"); return }
+        val screen = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(24,24,24,24); setBackgroundColor(Color.WHITE) }
+        screen.addView(TextView(this).apply { text = "Controle remoto Replay30"; textSize = 24f; setTextColor(0xFF111111.toInt()); gravity = Gravity.CENTER })
+        screen.addView(TextView(this).apply { text = "Conecte os dois celulares à mesma rede Wi-Fi e leia este QR Code no outro celular."; textSize = 16f; setTextColor(0xFF333333.toInt()); gravity = Gravity.CENTER; setPadding(0,16,0,12) })
+        screen.addView(ImageView(this).apply { setImageBitmap(qrBitmap); adjustViewBounds = true; scaleType = ImageView.ScaleType.FIT_CENTER; contentDescription = "QR Code Replay30" }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,0,1f))
+        screen.addView(TextView(this).apply { text = url; textSize = 14f; setTextColor(0xFF333333.toInt()); gravity = Gravity.CENTER; setPadding(0,12,0,12) })
+        screen.addView(Button(this).apply { text = "VOLTAR À CÂMERA"; setOnClickListener { setContentView(mainRoot) } })
         setContentView(screen)
     }
 
     private fun controlUrl(): String {
         val wifiIp = try {
-            val wm = applicationContext.getSystemService(android.content.Context.WIFI_SERVICE) as WifiManager
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             val n = wm.dhcpInfo.ipAddress
             if (n == 0) null else "${n and 255}.${(n shr 8) and 255}.${(n shr 16) and 255}.${(n shr 24) and 255}"
         } catch (_: Exception) { null }
         val ip = wifiIp ?: try {
-            java.util.Collections.list(NetworkInterface.getNetworkInterfaces())
-                .asSequence()
-                .filter { it.isUp && !it.isLoopback }
+            java.util.Collections.list(NetworkInterface.getNetworkInterfaces()).asSequence().filter { it.isUp && !it.isLoopback }
                 .sortedBy { if (it.name.startsWith("wlan") || it.name.startsWith("ap")) 0 else 1 }
-                .flatMap { java.util.Collections.list(it.inetAddresses).asSequence() }
-                .filterIsInstance<Inet4Address>()
-                .firstOrNull { !it.isLoopbackAddress && it.hostAddress != null }
-                ?.hostAddress
+                .flatMap { java.util.Collections.list(it.inetAddresses).asSequence() }.filterIsInstance<Inet4Address>()
+                .firstOrNull { !it.isLoopbackAddress && it.hostAddress != null }?.hostAddress
         } catch (_: Exception) { null }
         return if (ip == null) "" else "http://$ip:8765"
     }
 
-    private fun hasPermissions() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+    private fun hasCameraPermission() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
+    @Suppress("DEPRECATION")
     private fun startCamera() {
-        val providerFuture = ProcessCameraProvider.getInstance(this)
-        providerFuture.addListener({
-            try {
-                val provider = providerFuture.get()
-                val targetRotation = preview.display?.rotation ?: Surface.ROTATION_0
-                val previewUseCase = androidx.camera.core.Preview.Builder()
-                    .setTargetRotation(targetRotation)
-                    .build().also {
-                        it.setSurfaceProvider(preview.surfaceProvider)
-                    }
-                val recorder = Recorder.Builder()
-                    .setQualitySelector(QualitySelector.from(Quality.FHD))
-                    .build()
-                videoCapture = VideoCapture.withOutput(recorder).also {
-                    // Match the camera recording orientation to the portrait-locked screen.
-                    it.targetRotation = targetRotation
+        if (isRunning || !preview.isAvailable || !hasCameraPermission()) return
+        try {
+            cameraThread = HandlerThread("Replay30Camera").also { it.start() }
+            cameraHandler = Handler(cameraThread!!.looper)
+            val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val cameraId = manager.cameraIdList.firstOrNull { id -> manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK }
+                ?: manager.cameraIdList.first()
+            val chars = manager.getCameraCharacteristics(cameraId)
+            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = map?.getOutputSizes(SurfaceTexture::class.java)?.toList().orEmpty()
+            captureSize = sizes.filter { it.width >= 1280 && it.height >= 720 }.minByOrNull { kotlin.math.abs((it.width.toDouble()/it.height) - (16.0/9.0)) * 10000 + kotlin.math.abs(it.width*it.height - 1920*1080) } ?: Size(1920,1080)
+            val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            rotationHint = if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT) sensorOrientation else 0
+            setupEncoder()
+            val texture = preview.surfaceTexture ?: throw IllegalStateException("Preview indisponível")
+            texture.setDefaultBufferSize(captureSize.width, captureSize.height)
+            val previewSurface = Surface(texture)
+            val encSurface = encoderSurface ?: throw IllegalStateException("Superfície do encoder indisponível")
+            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    try {
+                        camera.createCaptureSession(listOf(previewSurface, encSurface), object : CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(session: CameraCaptureSession) {
+                                cameraSession = session
+                                try {
+                                    val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                        addTarget(previewSurface); addTarget(encSurface)
+                                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30,30))
+                                    }.build()
+                                    session.setRepeatingRequest(request, null, cameraHandler)
+                                    isRunning = true; captureActive.set(true)
+                                    startDrainThread()
+                                    runOnUiThread { status.text = "Captura contínua ativa · H.264 · sem reinícios periódicos"; toggleButton.text = "Parar captura" }
+                                } catch (e: Exception) { runOnUiThread { status.text = "Falha ao iniciar sessão: ${e.message}" } }
+                            }
+                            override fun onConfigureFailed(session: CameraCaptureSession) { runOnUiThread { status.text = "Falha ao configurar a câmera." }; stopCapture() }
+                        }, cameraHandler)
+                    } catch (e: Exception) { runOnUiThread { status.text = "Erro na sessão: ${e.message}" }; stopCapture() }
                 }
-                provider.unbindAll()
-                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, previewUseCase, videoCapture)
-                startLoop()
-            } catch (e: Exception) {
-                status.text = "Não foi possível iniciar a câmera: ${e.message}"
-            }
-        }, ContextCompat.getMainExecutor(this))
+                override fun onDisconnected(camera: CameraDevice) { camera.close(); cameraDevice = null; stopCapture() }
+                override fun onError(camera: CameraDevice, error: Int) { camera.close(); cameraDevice = null; runOnUiThread { status.text = "Erro da câmera: $error" }; stopCapture() }
+            }, cameraHandler)
+        } catch (e: Exception) { status.text = "Não foi possível iniciar: ${e.message}"; stopCapture() }
     }
 
-    private fun clipsDir(): File = File(getExternalFilesDir(null), "segments").apply { mkdirs() }
-
-    private fun startLoop() {
-        val capture = videoCapture ?: return
-        if (isRunning) return
-        isRunning = true
-        replayButton.isEnabled = false
-        toggleButton.text = "Parar captura"
-        status.text = "Iniciando buffer… aguarde alguns segundos"
-        startNextSegment(capture)
-    }
-
-    private fun startNextSegment(capture: VideoCapture<Recorder>) {
-        if (!isRunning) return
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-        val file = File(clipsDir(), "seg_$stamp.mp4")
-        val options = FileOutputOptions.Builder(file).build()
-        var pending = capture.output.prepareRecording(this, options)
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            pending = pending.withAudioEnabled()
+    private fun setupEncoder() {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, captureSize.width, captureSize.height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
-        segmentStartedAt = System.currentTimeMillis()
-        recording = pending.start(ContextCompat.getMainExecutor(this)) { event ->
-            when (event) {
-                is VideoRecordEvent.Start -> {
-                    status.text = "Buffer ativo · 1080p · últimos ~30 s"
-                }
-                is VideoRecordEvent.Finalize -> {
-                    if (event.hasError()) {
-                        file.delete()
-                        runOnUiThread { status.text = "Falha na gravação (${event.error})" }
-                    } else {
-                        synchronized(segments) { segments.addLast(file) }
-                        trimOldSegments()
+        encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also { codec ->
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            encoderSurface = codec.createInputSurface()
+            codec.start()
+        }
+        synchronized(bufferLock) { samples.clear(); bufferedBytes = 0; videoFormat = null; firstPtsUs = -1L; lastPtsUs = 0L }
+    }
+
+    private fun startDrainThread() {
+        drainThread = Thread {
+            val codec = encoder ?: return@Thread
+            val info = MediaCodec.BufferInfo()
+            while (captureActive.get()) {
+                try {
+                    when (val index = codec.dequeueOutputBuffer(info, 10_000)) {
+                        MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> synchronized(bufferLock) { videoFormat = codec.outputFormat }
+                        else -> if (index >= 0) {
+                            val out = codec.getOutputBuffer(index)
+                            if (out != null && info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                                out.position(info.offset); out.limit(info.offset + info.size)
+                                val bytes = ByteArray(info.size); out.get(bytes)
+                                synchronized(bufferLock) {
+                                    if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 || samples.isNotEmpty()) {
+                                        samples.addLast(EncodedSample(info.presentationTimeUs, info.flags, bytes)); bufferedBytes += bytes.size
+                                        if (firstPtsUs < 0) firstPtsUs = info.presentationTimeUs
+                                        lastPtsUs = info.presentationTimeUs
+                                        trimBufferLocked()
+                                    }
+                                }
+                                runOnUiThread { replayButton.isEnabled = isRunning && bufferedDurationLocked() >= 5_000_000L && !replayBusy }
+                            }
+                            codec.releaseOutputBuffer(index, false)
+                        }
                     }
-                    recording = null
-                    if (replayRequested) {
-                        replayRequested = false
-                        exportReplay()
-                    }
-                    // Start the next segment immediately after CameraX finalizes the previous one.
-                    // An intentional delay here creates a real hole in the rolling recording.
-                    if (isRunning) handler.post { startNextSegment(capture) }
-                    runOnUiThread { replayButton.isEnabled = isRunning && segments.size >= 2 && !replayBusy }
-                }
+                } catch (_: Exception) { if (captureActive.get()) Thread.sleep(5) }
             }
-        }
-        handler.postDelayed({
-            if (isRunning && recording != null) {
-                recording?.stop()
-            }
-        }, segmentMs)
+        }.apply { name = "Replay30EncoderDrain"; isDaemon = true; start() }
     }
 
-    private fun trimOldSegments() {
-        synchronized(segments) {
-            while (segments.size > keepSegments) {
-                val old = segments.removeFirst()
-                // Only delete after it is older than the rolling window.
-                old.delete()
-            }
+    private fun trimBufferLocked() {
+        val cutoff = lastPtsUs - maxBufferUs
+        while (samples.size > 1 && (samples.first().ptsUs < cutoff || bufferedBytes > maxBufferBytes)) {
+            val first = samples.removeFirst(); bufferedBytes -= first.data.size
+        }
+        // Always begin the retained ring at a keyframe so any export can be decoded independently.
+        while (samples.isNotEmpty() && samples.first().flags and MediaCodec.BUFFER_FLAG_KEY_FRAME == 0) {
+            val first = samples.removeFirst(); bufferedBytes -= first.data.size
         }
     }
 
-    private fun saveReplay(seconds: Int = 30) {
+    private fun bufferedDurationLocked(): Long = synchronized(bufferLock) {
+        if (samples.size < 2) 0L else samples.last().ptsUs - samples.first().ptsUs
+    }
+
+    private fun saveReplay(seconds: Int) {
         if (replayBusy) return
-        if (!isRunning || recording == null) {
-            toast("Inicie a captura e aguarde o buffer.")
-            return
-        }
-        replayBusy = true
-        replaySeconds = seconds
-        replayRequested = true
-        replayButton.isEnabled = false
-        status.text = "Fechando segmento e salvando replay…"
-        // Finalize the current segment first so we never copy an MP4 while it is still being written.
-        recording?.stop()
-    }
-
-    private fun exportReplay() {
-        // Select only the newest segments. Taking extra segments and then limiting the join
-        // to 30/60 seconds cut off the newest part of the replay and kept older footage instead.
-        val needed = (replaySeconds * 1_000L / segmentMs).toInt().coerceAtLeast(1)
-        val snapshot = synchronized(segments) { segments.toList().takeLast(needed) }
-        if (snapshot.size < 2) {
-            runOnUiThread {
-                replayBusy = false
-                replayButton.isEnabled = isRunning
-                status.text = "Buffer ainda curto; aguarde mais alguns segundos."
-            }
-            return
-        }
+        if (!isRunning) { toast("Inicie a captura e aguarde o buffer."); return }
+        replayBusy = true; replaySeconds = seconds; replayButton.isEnabled = false
+        status.text = "Salvando replay de $seconds s sem interromper a captura…"
         executor.execute {
             try {
+                val format: MediaFormat
+                val chosen: List<EncodedSample>
+                synchronized(bufferLock) {
+                    format = videoFormat ?: throw IllegalStateException("Encoder ainda está preparando o formato")
+                    val all = samples.toList()
+                    if (all.size < 2) throw IllegalStateException("Buffer ainda curto; aguarde alguns segundos")
+                    val end = all.last().ptsUs
+                    val desiredStart = end - seconds * 1_000_000L
+                    var startIndex = all.indexOfLast { it.ptsUs <= desiredStart && it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 }
+                    if (startIndex < 0) startIndex = all.indexOfFirst { it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 }
+                    if (startIndex < 0) throw IllegalStateException("Aguardando keyframe para iniciar o replay")
+                    chosen = all.drop(startIndex)
+                }
                 val outDir = File(getExternalFilesDir(null), "replays").apply { mkdirs() }
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val output = File(outDir, "Replay30_${replaySeconds}s_$stamp.mp4")
-                val joined = Mp4Joiner.join(snapshot, output, replaySeconds * 1_000_000L)
-                val galleryUri = if (joined) publishVideoToGallery(output) else null
-                if (joined && galleryUri != null) output.delete()
+                val output = File(outDir, "Replay30_${seconds}s_$stamp.mp4")
+                writeReplayMp4(chosen, format, output)
+                val uri = publishVideoToGallery(output)
+                if (uri != null) output.delete()
                 runOnUiThread {
-                    replayBusy = false
-                    replayButton.isEnabled = isRunning && segments.size >= 2
-                    status.text = when {
-                        !joined -> "Não foi possível montar o MP4; tente novamente."
-                        galleryUri != null -> "Vídeo salvo na galeria: Movies/Replay30/${output.name}"
-                        else -> "Vídeo montado, mas não foi possível enviá-lo à galeria. Arquivo local: ${output.absolutePath}"
-                    }
-                    toast(when {
-                        !joined -> "Falha ao montar MP4. O aparelho pode precisar de ajustes de compatibilidade."
-                        galleryUri != null -> "Replay salvo na galeria: ${output.name}"
-                        else -> "Replay criado, mas não apareceu na galeria. O arquivo ficou no armazenamento do app."
-                    })
+                    replayBusy = false; replayButton.isEnabled = isRunning
+                    status.text = if (uri != null) "Replay salvo na galeria: Movies/Replay30/${output.name}" else "Replay criado, mas não foi possível publicar na galeria: ${output.absolutePath}"
+                    toast(if (uri != null) "Replay salvo na galeria." else "Replay criado no armazenamento do app, mas não apareceu na galeria.")
                 }
             } catch (e: Exception) {
-                runOnUiThread {
-                    replayBusy = false
-                    replayButton.isEnabled = isRunning
-                    status.text = "Erro ao salvar replay: ${e.message}"
-                }
+                runOnUiThread { replayBusy = false; replayButton.isEnabled = isRunning; status.text = "Erro ao salvar replay: ${e.message}"; toast("Erro ao salvar replay: ${e.message}") }
             }
         }
     }
 
+    private fun writeReplayMp4(clip: List<EncodedSample>, format: MediaFormat, output: File) {
+        if (clip.isEmpty() || clip.first().flags and MediaCodec.BUFFER_FLAG_KEY_FRAME == 0) throw IllegalStateException("O trecho não começa em keyframe")
+        val muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        try {
+            if (rotationHint == 90 || rotationHint == 180 || rotationHint == 270) muxer.setOrientationHint(rotationHint)
+            val track = muxer.addTrack(format)
+            muxer.start()
+            val buffer = ByteBuffer.allocateDirect(clip.maxOf { it.data.size }.coerceAtLeast(1024))
+            val info = MediaCodec.BufferInfo()
+            val base = clip.first().ptsUs
+            for (sample in clip) {
+                buffer.clear(); buffer.put(sample.data); buffer.flip()
+                info.set(0, sample.data.size, (sample.ptsUs - base).coerceAtLeast(0L), sample.flags)
+                muxer.writeSampleData(track, buffer, info)
+            }
+            muxer.stop()
+        } finally { try { muxer.release() } catch (_: Exception) {} }
+    }
 
-    /** Publishes a completed MP4 to the user's Movies/Replay30 gallery folder on Android 10+. */
     private fun publishVideoToGallery(source: File): Uri? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, source.name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Replay30")
-            put(MediaStore.Video.Media.IS_PENDING, 1)
+            put(MediaStore.Video.Media.DISPLAY_NAME, source.name); put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Replay30"); put(MediaStore.Video.Media.IS_PENDING, 1)
         }
-        val resolver = contentResolver
-        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+        val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
         return try {
-            resolver.openOutputStream(uri, "w")?.use { outputStream ->
-                source.inputStream().use { inputStream -> inputStream.copyTo(outputStream) }
-            } ?: throw java.io.IOException("Não foi possível abrir o arquivo de destino")
-            val ready = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-            resolver.update(uri, ready, null, null)
-            uri
-        } catch (e: Exception) {
-            resolver.delete(uri, null, null)
-            null
-        }
+            contentResolver.openOutputStream(uri, "w")?.use { out -> source.inputStream().use { it.copyTo(out) } } ?: throw java.io.IOException("Não foi possível abrir o destino")
+            contentResolver.update(uri, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null); uri
+        } catch (_: Exception) { contentResolver.delete(uri, null, null); null }
     }
 
-    private fun stopLoop() {
-        isRunning = false
-        handler.removeCallbacksAndMessages(null)
-        recording?.stop()
-        recording = null
-        toggleButton.text = "Retomar captura"
-        replayButton.isEnabled = false
-        status.text = "Captura parada"
+    private fun stopCapture() {
+        isRunning = false; captureActive.set(false)
+        try { cameraSession?.stopRepeating() } catch (_: Exception) {}
+        try { cameraSession?.close() } catch (_: Exception) {}
+        cameraSession = null
+        try { cameraDevice?.close() } catch (_: Exception) {}
+        cameraDevice = null
+        try { encoder?.signalEndOfInputStream() } catch (_: Exception) {}
+        try { encoder?.stop() } catch (_: Exception) {}
+        try { encoder?.release() } catch (_: Exception) {}
+        encoder = null
+        try { encoderSurface?.release() } catch (_: Exception) {}
+        encoderSurface = null
+        try { cameraThread?.quitSafely() } catch (_: Exception) {}
+        cameraThread = null; cameraHandler = null
+        runOnUiThread { toggleButton.text = "Retomar captura"; replayButton.isEnabled = false; if (status.text.toString().startsWith("Captura contínua")) status.text = "Captura parada" }
     }
 
     fun setRemoteText(text: String) { if (::remoteInfo.isInitialized) remoteInfo.text = text }
-
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        // Alguns controles Bluetooth se apresentam como teclas de volume/câmera.
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_CAMERA) {
-            saveReplay(30)
-            return true
-        }
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_CAMERA) { saveReplay(30); return true }
         return super.onKeyDown(keyCode, event)
     }
-
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-
     override fun onDestroy() {
-        remoteServer?.stopServer()
-        stopLoop()
-        executor.shutdown()
-        super.onDestroy()
-    }
-}
-
-
-/** Muxes samples from the newest sequential MP4 segments, normalizing each segment's PTS. */
-private object Mp4Joiner {
-    fun join(files: List<File>, output: File, limitUs: Long): Boolean {
-        if (files.isEmpty()) return false
-        val extractors = mutableListOf<MediaExtractor>()
-        var muxer: MediaMuxer? = null
-        return try {
-            files.forEach { f -> extractors.add(MediaExtractor().apply { setDataSource(f.absolutePath) }) }
-            val first = extractors.first()
-            if (first.trackCount == 0) return false
-            val formats = (0 until first.trackCount).map { first.getTrackFormat(it) }
-            muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            val videoFormat = formats.firstOrNull {
-                it.getString(android.media.MediaFormat.KEY_MIME)?.startsWith("video/") == true
-            }
-            val rotation = try {
-                videoFormat?.getInteger(android.media.MediaFormat.KEY_ROTATION) ?: 0
-            } catch (_: Exception) { 0 }
-            if (rotation == 90 || rotation == 180 || rotation == 270) muxer.setOrientationHint(rotation)
-
-            val outputTracks = formats.map { muxer.addTrack(it) }
-            val maps = mutableListOf<IntArray>()
-            maps.add(outputTracks.toIntArray())
-            for (ex in extractors.drop(1)) {
-                val map = IntArray(ex.trackCount) { -1 }
-                for (i in 0 until ex.trackCount) {
-                    val mime = ex.getTrackFormat(i).getString(android.media.MediaFormat.KEY_MIME)
-                    map[i] = formats.indexOfFirst { it.getString(android.media.MediaFormat.KEY_MIME) == mime }
-                    if (map[i] < 0) return false
-                }
-                maps.add(map)
-            }
-
-            // CameraX segments typically restart their timestamps at zero. Measure the actual
-            // PTS range of every segment and place the next one after a frame duration, rather
-            // than adding just 1 microsecond (which can cause overlapping frame intervals).
-            data class Timing(val firstPts: Long, val duration: Long)
-            val timings = extractors.map { ex ->
-                for (t in 0 until ex.trackCount) ex.selectTrack(t)
-                var minPts = Long.MAX_VALUE
-                var maxPts = 0L
-                while (true) {
-                    val pts = ex.sampleTime
-                    if (pts < 0) break
-                    if (pts < minPts) minPts = pts
-                    if (pts > maxPts) maxPts = pts
-                    ex.advance()
-                }
-                for (t in 0 until ex.trackCount) {
-                    try { ex.unselectTrack(t) } catch (_: Exception) {}
-                    try { ex.selectTrack(t) } catch (_: Exception) {}
-                }
-                if (minPts == Long.MAX_VALUE) minPts = 0L
-                val frameRate = try {
-                    if (videoFormat != null && videoFormat.containsKey(android.media.MediaFormat.KEY_FRAME_RATE))
-                        videoFormat.getInteger(android.media.MediaFormat.KEY_FRAME_RATE).coerceIn(1, 120)
-                    else 30
-                } catch (_: Exception) { 30 }
-                val frameDurationUs = 1_000_000L / frameRate
-                Timing(minPts, (maxPts - minPts + frameDurationUs).coerceAtLeast(frameDurationUs))
-            }
-
-            // Rewind extractors after measuring timestamps.
-            extractors.forEach { ex ->
-                ex.release()
-            }
-            extractors.clear()
-            files.forEach { f -> extractors.add(MediaExtractor().apply { setDataSource(f.absolutePath) }) }
-
-            muxer.start()
-            val buffer = java.nio.ByteBuffer.allocate(4 * 1024 * 1024)
-            val info = MediaCodec.BufferInfo()
-            var offsetUs = 0L
-            for ((idx, ex) in extractors.withIndex()) {
-                for (t in 0 until ex.trackCount) ex.selectTrack(t)
-                val timing = timings[idx]
-                while (true) {
-                    buffer.clear()
-                    val size = ex.readSampleData(buffer, 0)
-                    if (size < 0) break
-                    val pts = ex.sampleTime
-                    val shifted = offsetUs + (pts - timing.firstPts).coerceAtLeast(0L)
-                    if (shifted > limitUs) break
-                    info.set(0, size, shifted, ex.sampleFlags)
-                    val track = maps[idx][ex.sampleTrackIndex]
-                    if (track >= 0) muxer.writeSampleData(track, buffer, info)
-                    ex.advance()
-                }
-                offsetUs += timing.duration
-                if (offsetUs >= limitUs) break
-            }
-            muxer.stop()
-            output.exists() && output.length() > 1024
-        } catch (_: Exception) {
-            false
-        } finally {
-            try { muxer?.release() } catch (_: Exception) {}
-            extractors.forEach { try { it.release() } catch (_: Exception) {} }
-        }
+        remoteServer?.stopServer(); stopCapture(); executor.shutdown(); super.onDestroy()
     }
 }
 
