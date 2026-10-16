@@ -17,3 +17,8 @@ Projeto inicial de replay esportivo instantâneo. O app mantém segmentos MP4 te
 
 ## Estado e limitações
 Este é um protótipo inicial e ainda precisa de build e teste em aparelho real. A captura é feita em segmentos curtos e a junção de MP4 pode falhar se o aparelho produzir formatos de áudio/vídeo incompatíveis; a troca entre segmentos também pode gerar pequenas lacunas. O controle remoto por QR Code depende de ambos os celulares estarem na mesma rede Wi-Fi (ou numa rede local que permita comunicação entre dispositivos). O QR Code apenas abre o endereço local; não cria a conexão Wi-Fi. Algumas redes de convidados bloqueiam a comunicação entre aparelhos. A tela do QR Code só funciona quando o Android consegue identificar o IP da rede. O servidor HTTP local não tem autenticação: use apenas em uma rede confiável. A gravação depende de manter o app aberto em primeiro plano.
+
+
+## Ajustes de continuidade do vídeo
+
+Esta versão inclui correções na montagem do replay: seleciona os segmentos mais recentes (6 para 30 s e 12 para 60 s, com segmentos de 5 s), normaliza os timestamps de cada segmento ao concatenar e remove a espera artificial de 120 ms entre segmentos. Isso corrige erros de seleção de trechos antigos e de sobreposição de timestamps na montagem. Como a captura ainda reinicia a gravação a cada segmento, pequenos intervalos físicos podem continuar dependendo do aparelho/CameraX.

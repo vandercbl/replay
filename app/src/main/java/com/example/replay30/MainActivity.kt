@@ -291,7 +291,9 @@ class MainActivity : ComponentActivity() {
                         replayRequested = false
                         exportReplay()
                     }
-                    if (isRunning) handler.postDelayed({ startNextSegment(capture) }, 0)
+                    // Start the next segment immediately after CameraX finalizes the previous one.
+                    // An intentional delay here creates a real hole in the rolling recording.
+                    if (isRunning) handler.post { startNextSegment(capture) }
                     runOnUiThread { replayButton.isEnabled = isRunning && segments.size >= 2 && !replayBusy }
                 }
             }
@@ -329,10 +331,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun exportReplay() {
-        // Use only the newest segments needed for the requested replay. The previous
-        // implementation selected extra segments and then truncated from the beginning,
-        // which could omit the most recent action from the saved clip.
-        val needed = (replaySeconds / (segmentMs / 1_000L)).toInt().coerceAtLeast(1)
+        // Select only the newest segments. Taking extra segments and then limiting the join
+        // to 30/60 seconds cut off the newest part of the replay and kept older footage instead.
+        val needed = (replaySeconds * 1_000L / segmentMs).toInt().coerceAtLeast(1)
         val snapshot = synchronized(segments) { segments.toList().takeLast(needed) }
         if (snapshot.size < 2) {
             runOnUiThread {
@@ -431,7 +432,7 @@ class MainActivity : ComponentActivity() {
 }
 
 
-/** Muxes encoded samples from sequential MP4 segments into one MP4 without re-encoding. */
+/** Muxes samples from the newest sequential MP4 segments, normalizing each segment's PTS. */
 private object Mp4Joiner {
     fun join(files: List<File>, output: File, limitUs: Long): Boolean {
         if (files.isEmpty()) return false
@@ -443,17 +444,14 @@ private object Mp4Joiner {
             if (first.trackCount == 0) return false
             val formats = (0 until first.trackCount).map { first.getTrackFormat(it) }
             muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            // Preserve the camera's rotation metadata when joining the short segments.
-            // Without this hint, the encoded samples can be correct but gallery apps may
-            // interpret the final MP4 as landscape.
-            val rotation = try {
-                if (first.getTrackFormat(0).containsKey(android.media.MediaFormat.KEY_ROTATION)) {
-                    first.getTrackFormat(0).getInteger(android.media.MediaFormat.KEY_ROTATION)
-                } else 0
-            } catch (_: Exception) { 0 }
-            if (rotation == 90 || rotation == 180 || rotation == 270) {
-                muxer.setOrientationHint(rotation)
+            val videoFormat = formats.firstOrNull {
+                it.getString(android.media.MediaFormat.KEY_MIME)?.startsWith("video/") == true
             }
+            val rotation = try {
+                videoFormat?.getInteger(android.media.MediaFormat.KEY_ROTATION) ?: 0
+            } catch (_: Exception) { 0 }
+            if (rotation == 90 || rotation == 180 || rotation == 270) muxer.setOrientationHint(rotation)
+
             val outputTracks = formats.map { muxer.addTrack(it) }
             val maps = mutableListOf<IntArray>()
             maps.add(outputTracks.toIntArray())
@@ -466,46 +464,63 @@ private object Mp4Joiner {
                 }
                 maps.add(map)
             }
+
+            // CameraX segments typically restart their timestamps at zero. Measure the actual
+            // PTS range of every segment and place the next one after a frame duration, rather
+            // than adding just 1 microsecond (which can cause overlapping frame intervals).
+            data class Timing(val firstPts: Long, val duration: Long)
+            val timings = extractors.map { ex ->
+                for (t in 0 until ex.trackCount) ex.selectTrack(t)
+                var minPts = Long.MAX_VALUE
+                var maxPts = 0L
+                while (true) {
+                    val pts = ex.sampleTime
+                    if (pts < 0) break
+                    if (pts < minPts) minPts = pts
+                    if (pts > maxPts) maxPts = pts
+                    ex.advance()
+                }
+                for (t in 0 until ex.trackCount) {
+                    try { ex.unselectTrack(t) } catch (_: Exception) {}
+                    try { ex.selectTrack(t) } catch (_: Exception) {}
+                }
+                if (minPts == Long.MAX_VALUE) minPts = 0L
+                val frameRate = try {
+                    if (videoFormat != null && videoFormat.containsKey(android.media.MediaFormat.KEY_FRAME_RATE))
+                        videoFormat.getInteger(android.media.MediaFormat.KEY_FRAME_RATE).coerceIn(1, 120)
+                    else 30
+                } catch (_: Exception) { 30 }
+                val frameDurationUs = 1_000_000L / frameRate
+                Timing(minPts, (maxPts - minPts + frameDurationUs).coerceAtLeast(frameDurationUs))
+            }
+
+            // Rewind extractors after measuring timestamps.
+            extractors.forEach { ex ->
+                ex.release()
+            }
+            extractors.clear()
+            files.forEach { f -> extractors.add(MediaExtractor().apply { setDataSource(f.absolutePath) }) }
+
             muxer.start()
-            val buffer = java.nio.ByteBuffer.allocate(2 * 1024 * 1024)
+            val buffer = java.nio.ByteBuffer.allocate(4 * 1024 * 1024)
             val info = MediaCodec.BufferInfo()
             var offsetUs = 0L
             for ((idx, ex) in extractors.withIndex()) {
                 for (t in 0 until ex.trackCount) ex.selectTrack(t)
-
-                // MP4 samples usually end before the nominal segment duration (the final
-                // frame's PTS is not the end of the segment). Advancing by maxPts + 1 us
-                // caused adjacent segments to overlap in time, which can look like a tiny
-                // freeze/jump in some players. Prefer the duration declared by the tracks;
-                // fall back to the last PTS plus the last observed sample interval.
-                var maxPts = 0L
-                var lastPts = -1L
-                var lastDelta = 33_333L
-                var declaredDurationUs = 0L
-                for (t in 0 until ex.trackCount) {
-                    val format = ex.getTrackFormat(t)
-                    if (format.containsKey(android.media.MediaFormat.KEY_DURATION)) {
-                        declaredDurationUs = maxOf(declaredDurationUs, format.getLong(android.media.MediaFormat.KEY_DURATION))
-                    }
-                }
+                val timing = timings[idx]
                 while (true) {
                     buffer.clear()
                     val size = ex.readSampleData(buffer, 0)
                     if (size < 0) break
                     val pts = ex.sampleTime
-                    if (lastPts >= 0L && pts > lastPts) lastDelta = pts - lastPts
-                    lastPts = pts
-                    maxPts = maxOf(maxPts, pts)
-                    val shifted = offsetUs + pts
-                    if (shifted <= limitUs) {
-                        info.set(0, size, shifted, ex.sampleFlags)
-                        muxer.writeSampleData(maps[idx][ex.sampleTrackIndex], buffer, info)
-                    }
+                    val shifted = offsetUs + (pts - timing.firstPts).coerceAtLeast(0L)
+                    if (shifted > limitUs) break
+                    info.set(0, size, shifted, ex.sampleFlags)
+                    val track = maps[idx][ex.sampleTrackIndex]
+                    if (track >= 0) muxer.writeSampleData(track, buffer, info)
                     ex.advance()
                 }
-                val measuredDurationUs = maxPts + lastDelta
-                val segmentDurationUs = maxOf(declaredDurationUs, measuredDurationUs, 1L)
-                offsetUs += segmentDurationUs
+                offsetUs += timing.duration
                 if (offsetUs >= limitUs) break
             }
             muxer.stop()
