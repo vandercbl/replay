@@ -291,7 +291,7 @@ class MainActivity : ComponentActivity() {
                         replayRequested = false
                         exportReplay()
                     }
-                    if (isRunning) handler.postDelayed({ startNextSegment(capture) }, 120)
+                    if (isRunning) handler.postDelayed({ startNextSegment(capture) }, 0)
                     runOnUiThread { replayButton.isEnabled = isRunning && segments.size >= 2 && !replayBusy }
                 }
             }
@@ -329,7 +329,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun exportReplay() {
-        val needed = (replaySeconds / 5) + 2
+        // Use only the newest segments needed for the requested replay. The previous
+        // implementation selected extra segments and then truncated from the beginning,
+        // which could omit the most recent action from the saved clip.
+        val needed = (replaySeconds / (segmentMs / 1_000L)).toInt().coerceAtLeast(1)
         val snapshot = synchronized(segments) { segments.toList().takeLast(needed) }
         if (snapshot.size < 2) {
             runOnUiThread {
@@ -469,20 +472,40 @@ private object Mp4Joiner {
             var offsetUs = 0L
             for ((idx, ex) in extractors.withIndex()) {
                 for (t in 0 until ex.trackCount) ex.selectTrack(t)
+
+                // MP4 samples usually end before the nominal segment duration (the final
+                // frame's PTS is not the end of the segment). Advancing by maxPts + 1 us
+                // caused adjacent segments to overlap in time, which can look like a tiny
+                // freeze/jump in some players. Prefer the duration declared by the tracks;
+                // fall back to the last PTS plus the last observed sample interval.
                 var maxPts = 0L
+                var lastPts = -1L
+                var lastDelta = 33_333L
+                var declaredDurationUs = 0L
+                for (t in 0 until ex.trackCount) {
+                    val format = ex.getTrackFormat(t)
+                    if (format.containsKey(android.media.MediaFormat.KEY_DURATION)) {
+                        declaredDurationUs = maxOf(declaredDurationUs, format.getLong(android.media.MediaFormat.KEY_DURATION))
+                    }
+                }
                 while (true) {
                     buffer.clear()
                     val size = ex.readSampleData(buffer, 0)
                     if (size < 0) break
                     val pts = ex.sampleTime
+                    if (lastPts >= 0L && pts > lastPts) lastDelta = pts - lastPts
+                    lastPts = pts
+                    maxPts = maxOf(maxPts, pts)
                     val shifted = offsetUs + pts
-                    if (shifted > limitUs) break
-                    info.set(0, size, shifted, ex.sampleFlags)
-                    muxer.writeSampleData(maps[idx][ex.sampleTrackIndex], buffer, info)
-                    if (pts > maxPts) maxPts = pts
+                    if (shifted <= limitUs) {
+                        info.set(0, size, shifted, ex.sampleFlags)
+                        muxer.writeSampleData(maps[idx][ex.sampleTrackIndex], buffer, info)
+                    }
                     ex.advance()
                 }
-                offsetUs += maxPts + 1
+                val measuredDurationUs = maxPts + lastDelta
+                val segmentDurationUs = maxOf(declaredDurationUs, measuredDurationUs, 1L)
+                offsetUs += segmentDurationUs
                 if (offsetUs >= limitUs) break
             }
             muxer.stop()
