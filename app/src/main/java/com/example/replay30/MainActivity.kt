@@ -3,6 +3,9 @@ package com.example.replay30
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.ContentValues
+import android.app.AlertDialog
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -18,8 +21,11 @@ import android.media.MediaExtractor
 import android.media.MediaMuxer
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -43,12 +49,15 @@ import java.util.Locale
 import java.util.ArrayDeque
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
 
 /**
  * Replay30 prototype. Rotates 5-second MP4 segments and preserves the recent segment window.
  * Maintains a rolling set of short MP4 segments and joins the most recent 30/60 seconds on demand.
  */
 class MainActivity : ComponentActivity() {
+    private lateinit var mainRoot: LinearLayout
     private lateinit var preview: PreviewView
     private lateinit var status: TextView
     private lateinit var replayButton: Button
@@ -87,7 +96,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildUi() {
-        val root = LinearLayout(this).apply {
+        mainRoot = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(18, 18, 18, 18)
             setBackgroundColor(0xFFFFFFFF.toInt())
@@ -118,15 +127,98 @@ class MainActivity : ComponentActivity() {
             text = "Parar captura"
             setOnClickListener { if (isRunning) stopLoop() else startLoop() }
         }
-        root.addView(title)
-        root.addView(status)
-        root.addView(preview)
-        root.addView(replayButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(Button(this).apply { text = "SALVAR REPLAY — 60 s"; setOnClickListener { saveReplay(60) } }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(toggleButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        mainRoot.addView(title)
+        mainRoot.addView(status)
+        mainRoot.addView(preview)
+        mainRoot.addView(replayButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        mainRoot.addView(Button(this).apply { text = "SALVAR REPLAY — 60 s"; setOnClickListener { saveReplay(60) } }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        mainRoot.addView(toggleButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         remoteInfo = TextView(this).apply { textSize = 12f; setTextColor(0xFF555555.toInt()); setPadding(0, 8, 0, 0) }
-        root.addView(remoteInfo)
-        setContentView(root)
+        mainRoot.addView(remoteInfo)
+        mainRoot.addView(Button(this).apply {
+            text = "CONTROLE REMOTO — QR CODE"
+            textSize = 16f
+            setOnClickListener { showQrScreen() }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        setContentView(mainRoot)
+    }
+
+    private fun showQrScreen() {
+        val url = controlUrl()
+        if (url.isBlank()) {
+            toast("Não consegui identificar o IP da rede. Conecte o celular a uma rede Wi-Fi e tente novamente.")
+            return
+        }
+        val qrBitmap = try {
+            val matrix = QRCodeWriter().encode(url, BarcodeFormat.QR_CODE, 720, 720)
+            Bitmap.createBitmap(matrix.width, matrix.height, Bitmap.Config.ARGB_8888).also { bitmap ->
+                for (x in 0 until matrix.width) {
+                    for (y in 0 until matrix.height) {
+                        bitmap.setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            toast("Não foi possível gerar o QR Code: ${e.message}")
+            return
+        }
+
+        val screen = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(24, 24, 24, 24)
+            setBackgroundColor(Color.WHITE)
+        }
+        screen.addView(TextView(this).apply {
+            text = "Controle remoto Replay30"
+            textSize = 24f
+            setTextColor(0xFF111111.toInt())
+            gravity = Gravity.CENTER
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        screen.addView(TextView(this).apply {
+            text = "Conecte os dois celulares à mesma rede Wi-Fi. No outro celular, abra a câmera e leia este QR Code."
+            textSize = 16f
+            setTextColor(0xFF333333.toInt())
+            gravity = Gravity.CENTER
+            setPadding(0, 16, 0, 12)
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        screen.addView(ImageView(this).apply {
+            setImageBitmap(qrBitmap)
+            adjustViewBounds = true
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = "QR Code para abrir o controle remoto Replay30"
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        screen.addView(TextView(this).apply {
+            text = url
+            textSize = 14f
+            setTextColor(0xFF333333.toInt())
+            gravity = Gravity.CENTER
+            setPadding(0, 12, 0, 12)
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        screen.addView(Button(this).apply {
+            text = "VOLTAR À CÂMERA"
+            setOnClickListener { setContentView(mainRoot) }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        setContentView(screen)
+    }
+
+    private fun controlUrl(): String {
+        val wifiIp = try {
+            val wm = applicationContext.getSystemService(android.content.Context.WIFI_SERVICE) as WifiManager
+            val n = wm.dhcpInfo.ipAddress
+            if (n == 0) null else "${n and 255}.${(n shr 8) and 255}.${(n shr 16) and 255}.${(n shr 24) and 255}"
+        } catch (_: Exception) { null }
+        val ip = wifiIp ?: try {
+            java.util.Collections.list(NetworkInterface.getNetworkInterfaces())
+                .asSequence()
+                .filter { it.isUp && !it.isLoopback }
+                .sortedBy { if (it.name.startsWith("wlan") || it.name.startsWith("ap")) 0 else 1 }
+                .flatMap { java.util.Collections.list(it.inetAddresses).asSequence() }
+                .filterIsInstance<Inet4Address>()
+                .firstOrNull { !it.isLoopbackAddress && it.hostAddress != null }
+                ?.hostAddress
+        } catch (_: Exception) { null }
+        return if (ip == null) "" else "http://$ip:8765"
     }
 
     private fun hasPermissions() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -399,7 +491,7 @@ private class ReplayHttpServer(private val activity: MainActivity, private val o
                     val n = wm.dhcpInfo.ipAddress
                     if (n == 0) "IP-DO-CELULAR" else "${n and 255}.${(n shr 8) and 255}.${(n shr 16) and 255}.${(n shr 24) and 255}"
                 } catch (_: Exception) { "IP-DO-CELULAR" }
-                activity.runOnUiThread { activity.setRemoteText("Controle remoto: http://$ip:8765 (mesmo Wi-Fi)") }
+                activity.runOnUiThread { activity.setRemoteText("Controle remoto pronto · mesma rede Wi-Fi · toque em QR Code") }
                 while (running) {
                     val client = server?.accept() ?: break
                     Thread { handle(client) }.start()
@@ -423,7 +515,7 @@ private class ReplayHttpServer(private val activity: MainActivity, private val o
                     body = """{"ok":true,"seconds":$seconds,"message":"Replay solicitado"}"""
                 } else {
                     type = "text/html; charset=utf-8"
-                    body = """<!doctype html><html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Replay30</title><style>body{font-family:sans-serif;background:#101827;color:white;text-align:center;padding:24px}button{width:100%;padding:22px;margin:12px 0;font-size:20px;background:#16a34a;color:white;border:0;border-radius:12px}</style><h1>Replay30</h1><button onclick="fetch('/replay?seconds=30')">Salvar 30 segundos</button><button onclick="fetch('/replay?seconds=60')">Salvar 60 segundos</button></html>"""
+                    body = """<!doctype html><html lang="pt-BR"><meta name="viewport" content="width=device-width,initial-scale=1"><meta charset="utf-8"><title>Replay30</title><style>body{font-family:system-ui,sans-serif;background:#101827;color:white;text-align:center;padding:24px;max-width:520px;margin:auto}button{width:100%;padding:24px 12px;margin:12px 0;font-size:21px;font-weight:700;background:#16a34a;color:white;border:0;border-radius:14px}#msg{min-height:2em;color:#cbd5e1}</style><h1>Replay30</h1><p>Controle remoto conectado à rede local</p><button onclick="replay(30)">Salvar últimos 30 segundos</button><button onclick="replay(60)">Salvar últimos 60 segundos</button><p id="msg" role="status"></p><script>async function replay(seconds){const m=document.getElementById('msg');m.textContent='Enviando comando…';try{const r=await fetch('/replay?seconds='+seconds);if(!r.ok)throw new Error();m.textContent='Comando enviado: replay de '+seconds+' s. Confira o celular que está gravando.';}catch(e){m.textContent='Não foi possível enviar. Verifique se os celulares estão na mesma rede Wi-Fi.';}}</script></html>"""
                 }
                 val bytes = body.toByteArray(Charsets.UTF_8)
                 val out = s.getOutputStream()

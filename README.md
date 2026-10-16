@@ -1,6 +1,6 @@
 # Replay30 — Android Kotlin + GitHub Actions
 
-Projeto inicial de replay esportivo instantâneo. O app mantém segmentos MP4 temporários da câmera traseira e oferece comandos para tentar montar um único MP4 de 30 ou 60 segundos. Os arquivos são salvos localmente no armazenamento específico do aplicativo (`Android/data/.../files/replays`).
+Projeto inicial de replay esportivo instantâneo. O app mantém segmentos MP4 temporários da câmera traseira e oferece comandos para tentar montar um único MP4 de 30 ou 60 segundos. Os replays finalizados são publicados na galeria do Android, na pasta `Movies/Replay30`; os segmentos temporários ficam no armazenamento específico do aplicativo.
 
 ## Gerar APK no GitHub Actions
 1. Extraia este ZIP e envie o conteúdo da pasta `Replay30` para a raiz de um repositório GitHub.
@@ -12,8 +12,8 @@ Projeto inicial de replay esportivo instantâneo. O app mantém segmentos MP4 te
 - Abra o app e permita câmera/microfone. Mantenha a tela ligada e o preview visível.
 - Aguarde o buffer acumular cerca de 30 ou 60 segundos.
 - Use os botões de 30s/60s. O arquivo resultante é gravado localmente.
-- Para acionar de outro celular, conecte ambos à mesma rede Wi-Fi e abra o endereço local mostrado na tela, na porta `8765`.
+- Para acionar de outro celular, conecte ambos à mesma rede Wi-Fi. No celular que grava, toque em **CONTROLE REMOTO — QR CODE**; no segundo, leia o código com a câmera e abra o endereço no navegador. Use os botões para salvar 30 ou 60 segundos. O servidor local usa a porta `8765`.
 - Alguns controles Bluetooth que simulam teclas de volume/câmera podem acionar replay de 30s enquanto o app está em primeiro plano. A compatibilidade varia conforme o controle.
 
 ## Estado e limitações
-Este é um protótipo inicial e ainda precisa de build e teste em aparelho real. A captura é feita em segmentos curtos e a junção de MP4 pode falhar se o aparelho produzir formatos de áudio/vídeo incompatíveis; a troca entre segmentos também pode gerar pequenas lacunas. O controle Bluetooth depende do perfil do dispositivo. O servidor HTTP local não tem autenticação: use apenas em uma rede confiável. A gravação depende de manter o app aberto em primeiro plano.
+Este é um protótipo inicial e ainda precisa de build e teste em aparelho real. A captura é feita em segmentos curtos e a junção de MP4 pode falhar se o aparelho produzir formatos de áudio/vídeo incompatíveis; a troca entre segmentos também pode gerar pequenas lacunas. O controle remoto por QR Code depende de ambos os celulares estarem na mesma rede Wi-Fi (ou numa rede local que permita comunicação entre dispositivos). O QR Code apenas abre o endereço local; não cria a conexão Wi-Fi. Algumas redes de convidados bloqueiam a comunicação entre aparelhos. A tela do QR Code só funciona quando o Android consegue identificar o IP da rede. O servidor HTTP local não tem autenticação: use apenas em uma rede confiável. A gravação depende de manter o app aberto em primeiro plano.
