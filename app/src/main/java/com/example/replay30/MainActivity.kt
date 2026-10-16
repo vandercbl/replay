@@ -348,13 +348,13 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     if (gestureEnabled && isRunning && !replayBusy) {
                         playGestureNotification()
-                        if (bufferedDurationLocked() >= 30_000_000L) {
-                            status.text = "Gesto reconhecido · salvando os últimos 30 segundos…"
-                            toast("Gesto reconhecido! Salvando replay de 30 segundos.")
-                            saveReplay(30)
+                        if (bufferedDurationLocked() >= 40_000_000L) {
+                            status.text = "Gesto reconhecido · salvando os últimos 40 segundos…"
+                            toast("Gesto reconhecido! Salvando replay de 40 segundos.")
+                            saveReplay(40)
                         } else {
-                            status.text = "Gesto reconhecido · aguarde o buffer completar 30 segundos"
-                            toast("Gesto reconhecido! Aguarde o buffer completar 30 segundos para salvar o replay.")
+                            status.text = "Gesto reconhecido · aguarde o buffer completar 40 segundos"
+                            toast("Gesto reconhecido! Aguarde o buffer completar 40 segundos para salvar o replay.")
                         }
                     }
                 }
