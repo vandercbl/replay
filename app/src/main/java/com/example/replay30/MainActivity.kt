@@ -15,6 +15,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.WindowManager
+import android.view.Surface
 import android.net.wifi.WifiManager
 import android.media.MediaCodec
 import android.media.MediaExtractor
@@ -228,13 +229,19 @@ class MainActivity : ComponentActivity() {
         providerFuture.addListener({
             try {
                 val provider = providerFuture.get()
-                val previewUseCase = androidx.camera.core.Preview.Builder().build().also {
-                    it.setSurfaceProvider(preview.surfaceProvider)
-                }
+                val targetRotation = preview.display?.rotation ?: Surface.ROTATION_0
+                val previewUseCase = androidx.camera.core.Preview.Builder()
+                    .setTargetRotation(targetRotation)
+                    .build().also {
+                        it.setSurfaceProvider(preview.surfaceProvider)
+                    }
                 val recorder = Recorder.Builder()
                     .setQualitySelector(QualitySelector.from(Quality.FHD))
                     .build()
-                videoCapture = VideoCapture.withOutput(recorder)
+                videoCapture = VideoCapture.withOutput(recorder).also {
+                    // Match the camera recording orientation to the portrait-locked screen.
+                    it.targetRotation = targetRotation
+                }
                 provider.unbindAll()
                 provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, previewUseCase, videoCapture)
                 startLoop()
@@ -433,6 +440,17 @@ private object Mp4Joiner {
             if (first.trackCount == 0) return false
             val formats = (0 until first.trackCount).map { first.getTrackFormat(it) }
             muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            // Preserve the camera's rotation metadata when joining the short segments.
+            // Without this hint, the encoded samples can be correct but gallery apps may
+            // interpret the final MP4 as landscape.
+            val rotation = try {
+                if (first.getTrackFormat(0).containsKey(android.media.MediaFormat.KEY_ROTATION)) {
+                    first.getTrackFormat(0).getInteger(android.media.MediaFormat.KEY_ROTATION)
+                } else 0
+            } catch (_: Exception) { 0 }
+            if (rotation == 90 || rotation == 180 || rotation == 270) {
+                muxer.setOrientationHint(rotation)
+            }
             val outputTracks = formats.map { muxer.addTrack(it) }
             val maps = mutableListOf<IntArray>()
             maps.add(outputTracks.toIntArray())
