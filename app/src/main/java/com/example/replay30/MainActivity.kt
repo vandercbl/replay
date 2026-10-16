@@ -279,14 +279,10 @@ class MainActivity : ComponentActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
-    override fun onDestroy() {
-        remoteServer?.stopServer()
-        super.onDestroy()
-    }
-
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 
     override fun onDestroy() {
+        remoteServer?.stopServer()
         stopLoop()
         executor.shutdown()
         super.onDestroy()
