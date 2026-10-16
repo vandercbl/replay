@@ -1,3 +1,7 @@
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -41,12 +45,17 @@ val downloadGestureModel by tasks.registering {
         if (!gestureModelFile.exists() || gestureModelFile.length() < 1_000_000L) {
             gestureModelFile.parentFile.mkdirs()
             val tempFile = file("src/main/assets/gesture_recognizer.task.download")
-            val modelUrl = java.net.URL("https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task")
-            modelUrl.openConnection().apply {
-                connectTimeout = 30_000
-                readTimeout = 120_000
-            }.getInputStream().use { input ->
-                tempFile.outputStream().use { output -> input.copyTo(output) }
+            val modelUrl = URL("https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task")
+            val connection = modelUrl.openConnection() as HttpURLConnection
+            connection.connectTimeout = 30_000
+            connection.readTimeout = 120_000
+            connection.requestMethod = "GET"
+            try {
+                connection.inputStream.use { input: InputStream ->
+                    tempFile.outputStream().use { output -> input.copyTo(output) }
+                }
+            } finally {
+                connection.disconnect()
             }
             if (tempFile.length() < 1_000_000L) {
                 tempFile.delete()
