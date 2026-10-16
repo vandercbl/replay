@@ -1,18 +1,22 @@
-# Replay30 — captura contínua (protótipo)
+# Replay30 — captura contínua com áudio (protótipo)
 
-Esta versão substitui a gravação em segmentos de 5 segundos por uma captura contínua com Camera2 + MediaCodec:
+Esta versão adiciona captura contínua de áudio à arquitetura Camera2 + MediaCodec:
 
 - Camera2 mantém a câmera aberta e entrega frames continuamente ao encoder H.264.
-- O app mantém amostras codificadas em um buffer circular limitado por tempo e memória.
-- Ao pedir replay de 30 ou 60 segundos, cria um MP4 a partir do buffer sem parar a captura.
-- Mantém preview, orientação vertical, botões de replay, QR Code e controle remoto por Wi-Fi, além de publicar o MP4 em `Movies/Replay30`.
+- O microfone é capturado continuamente com `AudioRecord` e codificado em AAC a 48 kHz mono.
+- Áudio e vídeo são mantidos em buffers circulares limitados por tempo e memória.
+- Ao solicitar replay de 30 ou 60 segundos, o app muxa as amostras de áudio e vídeo em um MP4 sem reiniciar a câmera.
+- Mantém preview, orientação vertical, botões de replay, QR Code e controle remoto por Wi-Fi.
+- Os MP4 são publicados em `Movies/Replay30`.
 
-## Limitações desta versão
+## Permissões
 
-- O encoder de áudio ainda não foi integrado nesta implementação; os MP4 gerados contêm vídeo sem áudio. A versão antiga usava áudio nos segmentos, portanto isso é uma limitação conhecida deste protótipo contínuo.
-- A escolha de resolução e rotação varia conforme o aparelho. Compile pelo GitHub Actions e teste no celular antes de usar em uma gravação importante.
-- Não foi possível compilar nem testar em aparelho real neste ambiente. O arquivo ZIP contém o código-fonte, não um APK validado.
+O aplicativo precisa de permissão para câmera e microfone. Se o acesso ao microfone for negado, a captura não inicia, pois esta versão foi preparada para gerar replay com áudio.
 
-## Build
+## Importante
 
-Envie os arquivos do projeto ao repositório GitHub e execute o workflow **Build Android APK** em Actions. O artefato esperado é `Replay30-debug-apk`.
+Este código-fonte foi alterado para incluir áudio, mas não foi possível compilar nem testar em um aparelho Android real neste ambiente. A sincronização, o encoder AAC disponível no aparelho e o comportamento do buffer precisam ser validados no dispositivo. Faça um teste curto falando perto do celular e reproduzindo o MP4 antes de usar em uma gravação importante.
+
+## Build pelo GitHub Actions
+
+Envie o conteúdo da pasta `Replay30` para a raiz do repositório e execute o workflow **Build Android APK** em Actions. O artefato esperado é `Replay30-debug-apk`.

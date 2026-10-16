@@ -28,6 +28,9 @@ import android.view.Surface
 import android.net.wifi.WifiManager
 import android.media.MediaCodec
 import android.media.MediaMuxer
+import android.media.AudioRecord
+import android.media.AudioFormat
+import android.media.MediaRecorder
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.Inet4Address
@@ -80,6 +83,17 @@ class MainActivity : ComponentActivity() {
     private var encoder: MediaCodec? = null
     private var encoderSurface: Surface? = null
     private var drainThread: Thread? = null
+    private var audioEncoder: MediaCodec? = null
+    private var audioRecord: AudioRecord? = null
+    private var audioDrainThread: Thread? = null
+    private var audioCaptureThread: Thread? = null
+    private var audioFormat: MediaFormat? = null
+    private val audioSamples = ArrayDeque<EncodedSample>()
+    private var audioBufferedBytes = 0L
+    private var audioStartPtsUs = 0L
+    private var audioFramesCaptured = 0L
+    private val audioSampleRate = 48_000
+    private val maxAudioBufferBytes = 24L * 1024L * 1024L
     private var captureSize = Size(1920, 1080)
     private var rotationHint = 90
     private val bufferLock = Any()
@@ -92,14 +106,14 @@ class MainActivity : ComponentActivity() {
     private val maxBufferBytes = 120L * 1024L * 1024L
     private val captureActive = AtomicBoolean(false)
 
-    private data class EncodedSample(val ptsUs: Long, val flags: Int, val data: ByteArray)
+    private data class EncodedSample(val ptsUs: Long, val flags: Int, val data: ByteArray, val isAudio: Boolean = false)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
-        if (result[Manifest.permission.CAMERA] == true) {
+        if (result[Manifest.permission.CAMERA] == true && result[Manifest.permission.RECORD_AUDIO] == true) {
             if (preview.isAvailable) startCamera() else preview.surfaceTextureListener = textureListener
-        } else toast("A permissão de câmera é necessária para gravar.")
+        } else toast("Permita o acesso à câmera e ao microfone para gravar vídeo com áudio.")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -108,7 +122,7 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         buildUi()
         remoteServer = ReplayHttpServer(this) { seconds -> runOnUiThread { saveReplay(seconds) } }.also { it.start() }
-        if (hasCameraPermission()) {
+        if (hasRequiredPermissions()) {
             if (preview.isAvailable) startCamera() else preview.surfaceTextureListener = textureListener
         } else permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
     }
@@ -148,7 +162,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private val textureListener = object : TextureView.SurfaceTextureListener {
-        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) { if (hasCameraPermission()) startCamera() }
+        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) { if (hasRequiredPermissions()) startCamera() }
         override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
         override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
         override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
@@ -188,10 +202,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun hasCameraPermission() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+    private fun hasAudioPermission() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    private fun hasRequiredPermissions() = hasCameraPermission() && hasAudioPermission()
 
     @Suppress("DEPRECATION")
     private fun startCamera() {
-        if (isRunning || !preview.isAvailable || !hasCameraPermission()) return
+        if (isRunning || !preview.isAvailable || !hasRequiredPermissions()) return
         try {
             cameraThread = HandlerThread("Replay30Camera").also { it.start() }
             cameraHandler = Handler(cameraThread!!.looper)
@@ -226,8 +242,9 @@ class MainActivity : ComponentActivity() {
                                     session.setRepeatingRequest(request, null, cameraHandler)
                                     isRunning = true; captureActive.set(true)
                                     startDrainThread()
-                                    runOnUiThread { status.text = "Captura contínua ativa · H.264 · sem reinícios periódicos"; toggleButton.text = "Parar captura" }
-                                } catch (e: Exception) { runOnUiThread { status.text = "Falha ao iniciar sessão: ${e.message}" } }
+                                    startAudioCapture()
+                                    runOnUiThread { status.text = "Captura contínua ativa · vídeo + áudio · sem reinícios periódicos"; toggleButton.text = "Parar captura" }
+                                } catch (e: Exception) { runOnUiThread { status.text = "Falha ao iniciar captura de áudio/vídeo: ${e.message}" }; stopCapture() }
                             }
                             override fun onConfigureFailed(session: CameraCaptureSession) { runOnUiThread { status.text = "Falha ao configurar a câmera." }; stopCapture() }
                         }, cameraHandler)
@@ -251,7 +268,99 @@ class MainActivity : ComponentActivity() {
             encoderSurface = codec.createInputSurface()
             codec.start()
         }
-        synchronized(bufferLock) { samples.clear(); bufferedBytes = 0; videoFormat = null; firstPtsUs = -1L; lastPtsUs = 0L }
+        synchronized(bufferLock) {
+            samples.clear(); audioSamples.clear(); bufferedBytes = 0; audioBufferedBytes = 0
+            videoFormat = null; audioFormat = null; firstPtsUs = -1L; lastPtsUs = 0L
+        }
+        setupAudioEncoder()
+    }
+
+    private fun setupAudioEncoder() {
+        val minBuffer = AudioRecord.getMinBufferSize(audioSampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuffer <= 0) throw IllegalStateException("Não foi possível inicializar o microfone (buffer $minBuffer)")
+        val recordBufferBytes = maxOf(minBuffer * 2, 16_384)
+        val record = AudioRecord(MediaRecorder.AudioSource.MIC, audioSampleRate, AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT, recordBufferBytes)
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            throw IllegalStateException("O microfone não pôde ser inicializado")
+        }
+        val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, audioSampleRate, 1).apply {
+            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16_384)
+        }
+        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.start()
+            audioEncoder = codec
+            audioRecord = record
+            audioFramesCaptured = 0L
+        } catch (e: Exception) {
+            try { codec.release() } catch (_: Exception) {}
+            record.release()
+            throw e
+        }
+    }
+
+    private fun startAudioCapture() {
+        val record = audioRecord ?: throw IllegalStateException("Microfone indisponível")
+        val codec = audioEncoder ?: throw IllegalStateException("Encoder de áudio indisponível")
+        audioFramesCaptured = 0L
+        audioStartPtsUs = System.nanoTime() / 1_000L
+        record.startRecording()
+        audioDrainThread = Thread {
+            val info = MediaCodec.BufferInfo()
+            while (captureActive.get() || audioEncoder != null) {
+                try {
+                    when (val index = codec.dequeueOutputBuffer(info, 10_000)) {
+                        MediaCodec.INFO_TRY_AGAIN_LATER -> if (!captureActive.get()) break
+                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> synchronized(bufferLock) { audioFormat = codec.outputFormat }
+                        else -> if (index >= 0) {
+                            val out = codec.getOutputBuffer(index)
+                            if (out != null && info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                                out.position(info.offset); out.limit(info.offset + info.size)
+                                val bytes = ByteArray(info.size); out.get(bytes)
+                                synchronized(bufferLock) {
+                                    audioSamples.addLast(EncodedSample(info.presentationTimeUs, info.flags, bytes, true))
+                                    audioBufferedBytes += bytes.size
+                                    val cutoff = info.presentationTimeUs - maxBufferUs
+                                    while (audioSamples.isNotEmpty() && (audioSamples.first().ptsUs < cutoff || audioBufferedBytes > maxAudioBufferBytes)) {
+                                        audioBufferedBytes -= audioSamples.removeFirst().data.size
+                                    }
+                                }
+                            }
+                            codec.releaseOutputBuffer(index, false)
+                        }
+                    }
+                } catch (_: Exception) { if (captureActive.get()) Thread.sleep(5) else break }
+            }
+        }.apply { name = "Replay30AudioEncoderDrain"; isDaemon = true; start() }
+
+        audioCaptureThread = Thread {
+            val pcm = ByteArray(8_192)
+            while (captureActive.get()) {
+                try {
+                    val count = record.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
+                    if (count <= 0) continue
+                    var offset = 0
+                    while (offset < count && captureActive.get()) {
+                        val inputIndex = codec.dequeueInputBuffer(10_000)
+                        if (inputIndex < 0) { Thread.sleep(2); continue }
+                        val input = codec.getInputBuffer(inputIndex) ?: continue
+                        input.clear()
+                        val toCopy = minOf(count - offset, input.remaining())
+                        input.put(pcm, offset, toCopy)
+                        val frames = toCopy / 2 // mono PCM16: 2 bytes per frame
+                        val pts = audioStartPtsUs + audioFramesCaptured * 1_000_000L / audioSampleRate
+                        codec.queueInputBuffer(inputIndex, 0, toCopy, pts, 0)
+                        audioFramesCaptured += frames
+                        offset += toCopy
+                    }
+                } catch (_: Exception) { if (captureActive.get()) Thread.sleep(5) }
+            }
+        }.apply { name = "Replay30AudioCapture"; isDaemon = true; start() }
     }
 
     private fun startDrainThread() {
@@ -270,7 +379,7 @@ class MainActivity : ComponentActivity() {
                                 val bytes = ByteArray(info.size); out.get(bytes)
                                 synchronized(bufferLock) {
                                     if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 || samples.isNotEmpty()) {
-                                        samples.addLast(EncodedSample(info.presentationTimeUs, info.flags, bytes)); bufferedBytes += bytes.size
+                                        samples.addLast(EncodedSample(info.presentationTimeUs, info.flags, bytes, false)); bufferedBytes += bytes.size
                                         if (firstPtsUs < 0) firstPtsUs = info.presentationTimeUs
                                         lastPtsUs = info.presentationTimeUs
                                         trimBufferLocked()
@@ -309,22 +418,30 @@ class MainActivity : ComponentActivity() {
         executor.execute {
             try {
                 val format: MediaFormat
+                val aFormat: MediaFormat
                 val chosen: List<EncodedSample>
                 synchronized(bufferLock) {
-                    format = videoFormat ?: throw IllegalStateException("Encoder ainda está preparando o formato")
-                    val all = samples.toList()
-                    if (all.size < 2) throw IllegalStateException("Buffer ainda curto; aguarde alguns segundos")
-                    val end = all.last().ptsUs
+                    format = videoFormat ?: throw IllegalStateException("Encoder de vídeo ainda está preparando o formato")
+                    aFormat = audioFormat ?: throw IllegalStateException("Encoder de áudio ainda está preparando o formato; aguarde alguns segundos")
+                    val allVideo = samples.toList()
+                    val allAudio = audioSamples.toList()
+                    if (allVideo.size < 2 || allAudio.isEmpty()) throw IllegalStateException("Buffer de áudio/vídeo ainda curto; aguarde alguns segundos")
+                    val end = allVideo.last().ptsUs
                     val desiredStart = end - seconds * 1_000_000L
-                    var startIndex = all.indexOfLast { it.ptsUs <= desiredStart && it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 }
-                    if (startIndex < 0) startIndex = all.indexOfFirst { it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 }
+                    var startIndex = allVideo.indexOfLast { it.ptsUs <= desiredStart && it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 }
+                    if (startIndex < 0) startIndex = allVideo.indexOfFirst { it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 }
                     if (startIndex < 0) throw IllegalStateException("Aguardando keyframe para iniciar o replay")
-                    chosen = all.drop(startIndex)
+                    val selectedVideo = allVideo.drop(startIndex)
+                    val clipStart = selectedVideo.first().ptsUs
+                    val clipEnd = selectedVideo.last().ptsUs
+                    val selectedAudio = allAudio.filter { it.ptsUs >= clipStart && it.ptsUs <= clipEnd + 30_000L }
+                    if (selectedAudio.isEmpty()) throw IllegalStateException("Ainda não há áudio no intervalo selecionado. Aguarde e tente novamente")
+                    chosen = (selectedVideo + selectedAudio).sortedBy { it.ptsUs }
                 }
                 val outDir = File(getExternalFilesDir(null), "replays").apply { mkdirs() }
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                 val output = File(outDir, "Replay30_${seconds}s_$stamp.mp4")
-                writeReplayMp4(chosen, format, output)
+                writeReplayMp4(chosen, format, aFormat, output)
                 val uri = publishVideoToGallery(output)
                 if (uri != null) output.delete()
                 runOnUiThread {
@@ -338,20 +455,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun writeReplayMp4(clip: List<EncodedSample>, format: MediaFormat, output: File) {
-        if (clip.isEmpty() || clip.first().flags and MediaCodec.BUFFER_FLAG_KEY_FRAME == 0) throw IllegalStateException("O trecho não começa em keyframe")
+    private fun writeReplayMp4(clip: List<EncodedSample>, videoFmt: MediaFormat, audioFmt: MediaFormat, output: File) {
+        val firstVideo = clip.firstOrNull { !it.isAudio && it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 }
+            ?: throw IllegalStateException("O trecho de vídeo não começa em keyframe")
         val muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         try {
             if (rotationHint == 90 || rotationHint == 180 || rotationHint == 270) muxer.setOrientationHint(rotationHint)
-            val track = muxer.addTrack(format)
+            val videoTrack = muxer.addTrack(videoFmt)
+            val audioTrack = muxer.addTrack(audioFmt)
             muxer.start()
             val buffer = ByteBuffer.allocateDirect(clip.maxOf { it.data.size }.coerceAtLeast(1024))
             val info = MediaCodec.BufferInfo()
-            val base = clip.first().ptsUs
-            for (sample in clip) {
+            val base = firstVideo.ptsUs
+            for (sample in clip.sortedBy { it.ptsUs }) {
                 buffer.clear(); buffer.put(sample.data); buffer.flip()
                 info.set(0, sample.data.size, (sample.ptsUs - base).coerceAtLeast(0L), sample.flags)
-                muxer.writeSampleData(track, buffer, info)
+                muxer.writeSampleData(if (sample.isAudio) audioTrack else videoTrack, buffer, info)
             }
             muxer.stop()
         } finally { try { muxer.release() } catch (_: Exception) {} }
@@ -372,6 +491,12 @@ class MainActivity : ComponentActivity() {
 
     private fun stopCapture() {
         isRunning = false; captureActive.set(false)
+        try { audioRecord?.stop() } catch (_: Exception) {}
+        try { audioRecord?.release() } catch (_: Exception) {}
+        audioRecord = null
+        try { audioEncoder?.stop() } catch (_: Exception) {}
+        try { audioEncoder?.release() } catch (_: Exception) {}
+        audioEncoder = null
         try { cameraSession?.stopRepeating() } catch (_: Exception) {}
         try { cameraSession?.close() } catch (_: Exception) {}
         cameraSession = null
@@ -383,6 +508,9 @@ class MainActivity : ComponentActivity() {
         encoder = null
         try { encoderSurface?.release() } catch (_: Exception) {}
         encoderSurface = null
+        try { audioDrainThread?.join(250) } catch (_: Exception) {}
+        try { audioCaptureThread?.join(250) } catch (_: Exception) {}
+        audioDrainThread = null; audioCaptureThread = null
         try { cameraThread?.quitSafely() } catch (_: Exception) {}
         cameraThread = null; cameraHandler = null
         runOnUiThread { toggleButton.text = "Retomar captura"; replayButton.isEnabled = false; if (status.text.toString().startsWith("Captura contínua")) status.text = "Captura parada" }
