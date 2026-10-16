@@ -2,6 +2,10 @@ package com.example.replay30
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.ContentValues
+import android.net.Uri
+import android.os.Build
+import android.provider.MediaStore
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -241,12 +245,22 @@ class MainActivity : ComponentActivity() {
                 val outDir = File(getExternalFilesDir(null), "replays").apply { mkdirs() }
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                 val output = File(outDir, "Replay30_${replaySeconds}s_$stamp.mp4")
-                val ok = Mp4Joiner.join(snapshot, output, replaySeconds * 1_000_000L)
+                val joined = Mp4Joiner.join(snapshot, output, replaySeconds * 1_000_000L)
+                val galleryUri = if (joined) publishVideoToGallery(output) else null
+                if (joined && galleryUri != null) output.delete()
                 runOnUiThread {
                     replayBusy = false
                     replayButton.isEnabled = isRunning && segments.size >= 2
-                    status.text = if (ok) "MP4 salvo localmente: ${output.name}" else "Não foi possível montar o MP4; tente novamente."
-                    toast(if (ok) "Replay salvo: ${output.name}" else "Falha ao montar MP4. O aparelho pode precisar de ajustes de compatibilidade.")
+                    status.text = when {
+                        !joined -> "Não foi possível montar o MP4; tente novamente."
+                        galleryUri != null -> "Vídeo salvo na galeria: Movies/Replay30/${output.name}"
+                        else -> "Vídeo montado, mas não foi possível enviá-lo à galeria. Arquivo local: ${output.absolutePath}"
+                    }
+                    toast(when {
+                        !joined -> "Falha ao montar MP4. O aparelho pode precisar de ajustes de compatibilidade."
+                        galleryUri != null -> "Replay salvo na galeria: ${output.name}"
+                        else -> "Replay criado, mas não apareceu na galeria. O arquivo ficou no armazenamento do app."
+                    })
                 }
             } catch (e: Exception) {
                 runOnUiThread {
@@ -255,6 +269,31 @@ class MainActivity : ComponentActivity() {
                     status.text = "Erro ao salvar replay: ${e.message}"
                 }
             }
+        }
+    }
+
+
+    /** Publishes a completed MP4 to the user's Movies/Replay30 gallery folder on Android 10+. */
+    private fun publishVideoToGallery(source: File): Uri? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, source.name)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Replay30")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+        val resolver = contentResolver
+        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+        return try {
+            resolver.openOutputStream(uri, "w")?.use { outputStream ->
+                source.inputStream().use { inputStream -> inputStream.copyTo(outputStream) }
+            } ?: throw java.io.IOException("Não foi possível abrir o arquivo de destino")
+            val ready = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+            resolver.update(uri, ready, null, null)
+            uri
+        } catch (e: Exception) {
+            resolver.delete(uri, null, null)
+            null
         }
     }
 
