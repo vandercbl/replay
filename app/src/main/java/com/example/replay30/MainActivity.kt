@@ -47,6 +47,10 @@ import android.view.TextureView
 import android.util.Size
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizer
+import com.google.mediapipe.framework.image.BitmapImageBuilder
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -71,12 +75,23 @@ class MainActivity : ComponentActivity() {
     private lateinit var status: TextView
     private lateinit var replayButton: Button
     private lateinit var toggleButton: Button
+    private lateinit var gestureToggleButton: Button
     private lateinit var remoteInfo: TextView
     private lateinit var executor: ExecutorService
+    private lateinit var gestureExecutor: ExecutorService
+    @Volatile private var gestureRecognizer: GestureRecognizer? = null
+    @Volatile private var gestureEnabled = false
+    private val gestureProcessing = AtomicBoolean(false)
+    private val gestureInitializing = AtomicBoolean(false)
+    private var gestureConsecutiveFrames = 0
+    private var gestureReleaseFrames = 0
+    private var gestureArmed = true
+    private var lastGestureTriggerMs = 0L
+    private val gestureCooldownMs = 8_000L
     private val handler = Handler(Looper.getMainLooper())
     private var remoteServer: ReplayHttpServer? = null
-    private var isRunning = false
-    private var replayBusy = false
+    @Volatile private var isRunning = false
+    @Volatile private var replayBusy = false
     private var replaySeconds = 30
     private var cameraDevice: CameraDevice? = null
     private var cameraSession: CameraCaptureSession? = null
@@ -121,8 +136,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         executor = Executors.newSingleThreadExecutor()
+        gestureExecutor = Executors.newSingleThreadExecutor()
+        gestureEnabled = getSharedPreferences("replay30_settings", MODE_PRIVATE).getBoolean("peace_gesture_enabled", false)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         buildUi()
+        updateGestureButton()
         remoteServer = ReplayHttpServer(this) { seconds -> runOnUiThread { saveReplay(seconds) } }.also { it.start() }
         if (hasRequiredPermissions()) {
             if (preview.isAvailable) startCamera() else preview.surfaceTextureListener = textureListener
@@ -155,6 +173,11 @@ class MainActivity : ComponentActivity() {
         mainRoot.addView(replayButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         mainRoot.addView(Button(this).apply { text = "SALVAR REPLAY — 60 s"; setOnClickListener { saveReplay(60) } }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         mainRoot.addView(toggleButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        gestureToggleButton = Button(this).apply {
+            textSize = 15f
+            setOnClickListener { setGestureDetectionEnabled(!gestureEnabled) }
+        }
+        mainRoot.addView(gestureToggleButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         remoteInfo = TextView(this).apply { textSize = 12f; setTextColor(0xFF555555.toInt()); setPadding(0, 8, 0, 0) }
         mainRoot.addView(remoteInfo)
         mainRoot.addView(Button(this).apply {
@@ -186,6 +209,132 @@ class MainActivity : ComponentActivity() {
         screen.addView(TextView(this).apply { text = url; textSize = 14f; setTextColor(0xFF333333.toInt()); gravity = Gravity.CENTER; setPadding(0,12,0,12) })
         screen.addView(Button(this).apply { text = "VOLTAR À CÂMERA"; setOnClickListener { setContentView(mainRoot) } })
         setContentView(screen)
+    }
+
+    private fun updateGestureButton() {
+        if (!::gestureToggleButton.isInitialized) return
+        gestureToggleButton.text = if (gestureEnabled) "GESTO ✌️: ATIVADO (salvar 30 s)" else "GESTO ✌️: DESATIVADO"
+    }
+
+    private fun setGestureDetectionEnabled(enabled: Boolean) {
+        gestureEnabled = enabled
+        getSharedPreferences("replay30_settings", MODE_PRIVATE).edit().putBoolean("peace_gesture_enabled", enabled).apply()
+        gestureConsecutiveFrames = 0
+        gestureReleaseFrames = 0
+        gestureArmed = true
+        updateGestureButton()
+        if (enabled) {
+            status.text = "Ativando reconhecimento do gesto ✌️…"
+            startGestureRecognizerIfNeeded()
+        } else {
+            status.text = if (isRunning) "Captura contínua ativa · detecção de gesto desativada" else "Detecção de gesto desativada"
+            toast("Detecção automática por gesto desativada.")
+        }
+    }
+
+    private fun startGestureRecognizerIfNeeded() {
+        if (!gestureEnabled) return
+        if (gestureRecognizer != null) {
+            startGestureFrameLoop()
+            return
+        }
+        // Camera startup and the button can both request initialization; create only one model.
+        if (!gestureInitializing.compareAndSet(false, true)) return
+        gestureExecutor.execute {
+            try {
+                val base = BaseOptions.builder().setModelAssetPath("gesture_recognizer.task").build()
+                val options = GestureRecognizer.GestureRecognizerOptions.builder()
+                    .setBaseOptions(base)
+                    .setRunningMode(RunningMode.IMAGE)
+                    .setNumHands(2)
+                    .setMinHandDetectionConfidence(0.55f)
+                    .setMinHandPresenceConfidence(0.55f)
+                    .setMinTrackingConfidence(0.55f)
+                    .build()
+                val recognizer = GestureRecognizer.createFromOptions(this, options)
+                gestureRecognizer = recognizer
+                runOnUiThread {
+                    if (gestureEnabled) {
+                        status.text = if (isRunning) "Captura ativa · gesto ✌️ habilitado (mantenha por cerca de 1 s)" else "Gesto ✌️ habilitado; inicie a captura para usar"
+                        startGestureFrameLoop()
+                        toast("Detecção do gesto ✌️ ativada. Mantenha o gesto visível por cerca de 1 segundo.")
+                    } else {
+                        try { recognizer.close() } catch (_: Exception) {}
+                        if (gestureRecognizer === recognizer) gestureRecognizer = null
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    gestureEnabled = false
+                    getSharedPreferences("replay30_settings", MODE_PRIVATE).edit().putBoolean("peace_gesture_enabled", false).apply()
+                    updateGestureButton()
+                    status.text = "Não foi possível iniciar a detecção de gesto: ${e.message}"
+                    toast("Falha ao iniciar o reconhecimento de gestos. Confira se o modelo foi incluído no APK.")
+                }
+            } finally {
+                gestureInitializing.set(false)
+            }
+        }
+    }
+
+    private fun startGestureFrameLoop() {
+        handler.removeCallbacks(gestureFrameRunnable)
+        handler.post(gestureFrameRunnable)
+    }
+
+    private val gestureFrameRunnable = object : Runnable {
+        override fun run() {
+            if (!gestureEnabled || gestureRecognizer == null || !isRunning || isFinishing || isDestroyed) {
+                if (gestureEnabled && !isFinishing && !isDestroyed) handler.postDelayed(this, 500L)
+                return
+            }
+            if (gestureProcessing.compareAndSet(false, true)) {
+                try {
+                    // Analyze a small copy of the visible preview at low frequency to minimize
+                    // impact on continuous recording and audio capture.
+                    val frame = preview.getBitmap(320, 180)
+                    if (frame != null) {
+                        gestureExecutor.execute {
+                            try { analyzeGestureFrame(frame) }
+                            catch (_: Exception) { }
+                            finally { frame.recycle(); gestureProcessing.set(false) }
+                        }
+                    } else gestureProcessing.set(false)
+                } catch (_: Exception) { gestureProcessing.set(false) }
+            }
+            handler.postDelayed(this, 300L)
+        }
+    }
+
+    private fun analyzeGestureFrame(bitmap: Bitmap) {
+        if (!gestureEnabled) return
+        val recognizer = gestureRecognizer ?: return
+        val result = recognizer.recognize(BitmapImageBuilder(bitmap).build())
+        val isPeace = result.gestures().any { categories ->
+            val top = categories.maxByOrNull { it.score() }
+            top != null && top.categoryName().equals("Victory", ignoreCase = true) && top.score() >= 0.72f
+        }
+        if (isPeace) {
+            gestureConsecutiveFrames++
+            gestureReleaseFrames = 0
+            if (gestureConsecutiveFrames >= 3 && gestureArmed && System.currentTimeMillis() - lastGestureTriggerMs >= gestureCooldownMs && !replayBusy && bufferedDurationLocked() >= 30_000_000L) {
+                gestureArmed = false
+                lastGestureTriggerMs = System.currentTimeMillis()
+                gestureConsecutiveFrames = 0
+                runOnUiThread {
+                    if (gestureEnabled && isRunning && !replayBusy) {
+                        status.text = "Gesto ✌️ reconhecido · salvando os últimos 30 segundos…"
+                        toast("Gesto reconhecido! Salvando replay de 30 segundos.")
+                        saveReplay(30)
+                    }
+                }
+            }
+        } else {
+            gestureConsecutiveFrames = 0
+            gestureReleaseFrames++
+            // Require the hand to leave the Victory pose before another automatic trigger.
+            if (gestureReleaseFrames >= 5) gestureArmed = true
+        }
     }
 
     private fun controlUrl(): String {
@@ -269,7 +418,7 @@ class MainActivity : ComponentActivity() {
                                     isRunning = true; captureActive.set(true)
                                     startDrainThread()
                                     startAudioCapture()
-                                    runOnUiThread { status.text = "Captura contínua ativa · vídeo + áudio · sem reinícios periódicos"; toggleButton.text = "Parar captura" }
+                                    runOnUiThread { status.text = "Captura contínua ativa · vídeo + áudio · sem reinícios periódicos"; toggleButton.text = "Parar captura"; if (gestureEnabled) startGestureRecognizerIfNeeded() }
                                 } catch (e: Exception) { runOnUiThread { status.text = "Falha ao iniciar captura de áudio/vídeo: ${e.message}" }; stopCapture() }
                             }
                             override fun onConfigureFailed(session: CameraCaptureSession) { runOnUiThread { status.text = "Falha ao configurar a câmera." }; stopCapture() }
@@ -549,7 +698,7 @@ class MainActivity : ComponentActivity() {
     }
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     override fun onDestroy() {
-        remoteServer?.stopServer(); stopCapture(); executor.shutdown(); super.onDestroy()
+        remoteServer?.stopServer(); handler.removeCallbacks(gestureFrameRunnable); stopCapture(); try { gestureRecognizer?.close() } catch (_: Exception) {}; gestureRecognizer = null; executor.shutdown(); gestureExecutor.shutdown(); super.onDestroy()
     }
 }
 
